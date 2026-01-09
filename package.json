@@ -1,0 +1,22 @@
+{
+  "name": "tlp-contracts",
+  "version": "1.0.0",
+  "description": "TLPStaking smart contracts for Timeleap",
+  "main": "index.js",
+  "scripts": {
+    "test": "hardhat test",
+    "compile": "hardhat compile",
+    "localnet": "hardhat node",
+    "localnet:setup": "hardhat run scripts/local-testnet.ts --network localhost"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@openzeppelin/contracts": "^5.5.0",
+    "@types/inquirer": "^8.2.12",
+    "chalk": "^4.1.2",
+    "hardhat": "^2.22.0",
+    "inquirer": "^8.2.7"
+  }
+}

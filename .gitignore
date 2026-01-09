@@ -1,0 +1,21 @@
+node_modules
+.env
+.env.*
+coverage
+coverage.json
+typechain
+typechain-types
+
+# Hardhat files
+cache
+artifacts
+
+# OS files
+.DS_Store
+
+# IDE
+.idea
+.vscode
+
+# Ignition deployments (contains private deployment data)
+ignition/deployments
