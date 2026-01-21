@@ -79,7 +79,7 @@ sequenceDiagram
 
 ## 3. Provider Withdraws Earnings
 
-Provider claims tokens for delivered services.
+Provider claims tokens for delivered services. A commission is deducted and sent to the treasury.
 
 ```mermaid
 sequenceDiagram
@@ -87,6 +87,7 @@ sequenceDiagram
     participant CLI as Timeleap CLI
     participant Backend as Timeleap Backend
     participant Contract as TLPStaking Contract
+    participant Treasury
 
     Provider->>CLI: Request withdrawal for rental
     CLI->>Backend: Verify service delivery
@@ -103,8 +104,10 @@ sequenceDiagram
     Contract->>Contract: Verify provider is rental recipient
     Contract->>Contract: Verify signatures
     Contract->>Contract: Check amount <= available balance
-    Contract->>Contract: Transfer TLP to provider
+    Contract->>Contract: Calculate commission<br/>(amount × commissionBps / 10000)
     Contract->>Contract: Update withdrawnAmount
+    Contract->>Treasury: Transfer commission
+    Contract->>Provider: Transfer (amount - commission)
     Contract-->>Provider: RentalWithdrawn event
 ```
 
@@ -347,7 +350,8 @@ flowchart TB
     P1 -->|"stake()"| PS1
     P2 -->|"stake()"| PS2
 
-    R2 -->|"withdrawRental()"| P1
+    R2 -->|"withdrawRental()<br/>(minus commission)"| P1
+    R2 -->|"commission"| Treasury
     R3 -->|"claimRefund()"| U3
 
     PS1 -->|"slashAndBan()"| Treasury
@@ -379,3 +383,13 @@ block.timestamp + duration + rentalGracePeriod <= provider.unlockTime
 ```
 
 This ensures the provider's stake remains locked for the entire rental period plus a 7-day grace period.
+
+### Commission on Withdrawals
+
+When providers withdraw their earnings, a commission is deducted and sent to the treasury:
+```
+commission = amount × commissionBps / 10000
+providerReceives = amount - commission
+```
+
+Commission is configured in basis points (e.g., 500 = 5%, 1000 = 10%). Maximum is 10000 (100%).

@@ -56,6 +56,7 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     error InvalidRequiredSignatures();
     error RentalExceedsStakeDuration();
     error ArrayLengthMismatch();
+    error CommissionTooHigh();
 
     // ============ Events ============
     event Staked(address indexed provider, uint256 amount, uint256 unlockTime);
@@ -87,6 +88,7 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     event RequiredRentalSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
     event RequiredWithdrawalSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
     event RequiredRefundSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
+    event CommissionUpdated(uint256 oldCommission, uint256 newCommission);
 
     // ============ Structs ============
     struct ProviderInfo {
@@ -113,6 +115,7 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
 
     uint256 public minStakeDuration = 30 days;
     uint256 public rentalGracePeriod = 7 days;
+    uint256 public commissionBps; // Commission in basis points (10000 = 100%)
 
     mapping(address => ProviderInfo) public providers;
     mapping(bytes32 => uint256) public vmPricePerSecond;
@@ -367,7 +370,13 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
 
         rental.withdrawnAmount += amount;
 
-        tlpToken.safeTransfer(_msgSender(), amount);
+        uint256 commission = (amount * commissionBps) / 10000;
+        uint256 providerAmount = amount - commission;
+
+        if (commission > 0) {
+            tlpToken.safeTransfer(treasury, commission);
+        }
+        tlpToken.safeTransfer(_msgSender(), providerAmount);
 
         emit RentalWithdrawn(_msgSender(), rentalId, amount);
     }
@@ -387,6 +396,7 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
         if (length != amounts.length || length != signatures.length) revert ArrayLengthMismatch();
 
         uint256 totalAmount = 0;
+        uint256 totalCommission = 0;
 
         for (uint256 i = 0; i < length; i++) {
             bytes32 rentalId = rentalIds[i];
@@ -413,11 +423,17 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
             );
 
             rental.withdrawnAmount += amount;
-            totalAmount += amount;
+
+            uint256 commission = (amount * commissionBps) / 10000;
+            totalCommission += commission;
+            totalAmount += amount - commission;
 
             emit RentalWithdrawn(_msgSender(), rentalId, amount);
         }
 
+        if (totalCommission > 0) {
+            tlpToken.safeTransfer(treasury, totalCommission);
+        }
         if (totalAmount > 0) {
             tlpToken.safeTransfer(_msgSender(), totalAmount);
         }
@@ -624,6 +640,19 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
         vmPricePerSecond[vm] = pricePerSecond;
 
         emit VmPriceUpdated(vm, oldPrice, pricePerSecond);
+    }
+
+    /**
+     * @notice Set commission rate for provider withdrawals
+     * @param newCommissionBps Commission in basis points (10000 = 100%, e.g., 500 = 5%)
+     */
+    function setCommission(uint256 newCommissionBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (newCommissionBps > 10000) revert CommissionTooHigh();
+
+        uint256 oldCommission = commissionBps;
+        commissionBps = newCommissionBps;
+
+        emit CommissionUpdated(oldCommission, newCommissionBps);
     }
 
     // ============ Internal Functions ============
