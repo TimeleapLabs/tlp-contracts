@@ -1316,6 +1316,317 @@ describe("TLPStaking", function () {
     });
   });
 
+  describe("Commission on Withdrawals", function () {
+    let rentalId: string;
+    const COMMISSION_5_PERCENT = 500n; // 5% in basis points
+    const COMMISSION_10_PERCENT = 1000n; // 10% in basis points
+
+    beforeEach(async function () {
+      await staking.connect(provider1).stake(STAKE_AMOUNT, MIN_STAKE_DURATION);
+      rentalId = await makeRental(user1, provider1, VM_SMALL, RENTAL_DURATION);
+    });
+
+    describe("setCommission", function () {
+      it("should allow admin to set commission", async function () {
+        await expect(staking.connect(admin).setCommission(COMMISSION_5_PERCENT))
+          .to.emit(staking, "CommissionUpdated")
+          .withArgs(0, COMMISSION_5_PERCENT);
+
+        expect(await staking.commissionBps()).to.equal(COMMISSION_5_PERCENT);
+      });
+
+      it("should reject commission above 100%", async function () {
+        await expect(
+          staking.connect(admin).setCommission(10001n)
+        ).to.be.revertedWithCustomError(staking, "CommissionTooHigh");
+      });
+
+      it("should allow setting commission to exactly 100%", async function () {
+        await expect(staking.connect(admin).setCommission(10000n))
+          .to.emit(staking, "CommissionUpdated")
+          .withArgs(0, 10000n);
+      });
+
+      it("should reject commission update by non-admin", async function () {
+        await expect(
+          staking.connect(user1).setCommission(COMMISSION_5_PERCENT)
+        ).to.be.reverted;
+      });
+
+      it("should allow setting commission to zero", async function () {
+        await staking.connect(admin).setCommission(COMMISSION_5_PERCENT);
+        await expect(staking.connect(admin).setCommission(0n))
+          .to.emit(staking, "CommissionUpdated")
+          .withArgs(COMMISSION_5_PERCENT, 0n);
+
+        expect(await staking.commissionBps()).to.equal(0);
+      });
+    });
+
+    describe("withdrawRental with commission", function () {
+      it("should deduct commission and send to treasury", async function () {
+        await staking.connect(admin).setCommission(COMMISSION_5_PERCENT);
+
+        const nonce = await staking.withdrawalNonces(rentalId);
+        const signatures = await signWithdrawalApproval(
+          [signer1, signer2],
+          rentalId,
+          provider1.address,
+          RENTAL_AMOUNT,
+          nonce
+        );
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).withdrawRental(rentalId, RENTAL_AMOUNT, signatures);
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        // Commission = RENTAL_AMOUNT * 500 / 10000 = 5%
+        const expectedCommission = (RENTAL_AMOUNT * COMMISSION_5_PERCENT) / 10000n;
+        const expectedProviderAmount = RENTAL_AMOUNT - expectedCommission;
+
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(expectedCommission);
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(expectedProviderAmount);
+      });
+
+      it("should calculate commission correctly for 10%", async function () {
+        await staking.connect(admin).setCommission(COMMISSION_10_PERCENT);
+
+        const nonce = await staking.withdrawalNonces(rentalId);
+        const signatures = await signWithdrawalApproval(
+          [signer1, signer2],
+          rentalId,
+          provider1.address,
+          RENTAL_AMOUNT,
+          nonce
+        );
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).withdrawRental(rentalId, RENTAL_AMOUNT, signatures);
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        // Commission = RENTAL_AMOUNT * 1000 / 10000 = 10%
+        const expectedCommission = (RENTAL_AMOUNT * COMMISSION_10_PERCENT) / 10000n;
+        const expectedProviderAmount = RENTAL_AMOUNT - expectedCommission;
+
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(expectedCommission);
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(expectedProviderAmount);
+      });
+
+      it("should transfer full amount to provider with 0% commission", async function () {
+        // Commission defaults to 0
+        expect(await staking.commissionBps()).to.equal(0);
+
+        const nonce = await staking.withdrawalNonces(rentalId);
+        const signatures = await signWithdrawalApproval(
+          [signer1, signer2],
+          rentalId,
+          provider1.address,
+          RENTAL_AMOUNT,
+          nonce
+        );
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).withdrawRental(rentalId, RENTAL_AMOUNT, signatures);
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        // No commission - treasury unchanged
+        expect(treasuryBalanceAfter).to.equal(treasuryBalanceBefore);
+        // Provider gets full amount
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(RENTAL_AMOUNT);
+      });
+
+      it("should transfer full amount to treasury with 100% commission", async function () {
+        await staking.connect(admin).setCommission(10000n); // 100%
+
+        const nonce = await staking.withdrawalNonces(rentalId);
+        const signatures = await signWithdrawalApproval(
+          [signer1, signer2],
+          rentalId,
+          provider1.address,
+          RENTAL_AMOUNT,
+          nonce
+        );
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).withdrawRental(rentalId, RENTAL_AMOUNT, signatures);
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        // Treasury gets full amount
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(RENTAL_AMOUNT);
+        // Provider gets nothing
+        expect(providerBalanceAfter).to.equal(providerBalanceBefore);
+      });
+
+      it("should handle partial withdrawal with commission", async function () {
+        await staking.connect(admin).setCommission(COMMISSION_5_PERCENT);
+        const halfAmount = RENTAL_AMOUNT / 2n;
+
+        const nonce = await staking.withdrawalNonces(rentalId);
+        const signatures = await signWithdrawalApproval(
+          [signer1, signer2],
+          rentalId,
+          provider1.address,
+          halfAmount,
+          nonce
+        );
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).withdrawRental(rentalId, halfAmount, signatures);
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        const expectedCommission = (halfAmount * COMMISSION_5_PERCENT) / 10000n;
+        const expectedProviderAmount = halfAmount - expectedCommission;
+
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(expectedCommission);
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(expectedProviderAmount);
+      });
+    });
+
+    describe("batchWithdrawRental with commission", function () {
+      let rentalId2: string;
+      let rentalId3: string;
+
+      beforeEach(async function () {
+        rentalId2 = await makeRental(user1, provider1, VM_SMALL, RENTAL_DURATION);
+        rentalId3 = await makeRental(user1, provider1, VM_SMALL, RENTAL_DURATION);
+      });
+
+      it("should deduct commission on batch withdrawal", async function () {
+        await staking.connect(admin).setCommission(COMMISSION_5_PERCENT);
+
+        const nonce1 = await staking.withdrawalNonces(rentalId);
+        const nonce2 = await staking.withdrawalNonces(rentalId2);
+        const nonce3 = await staking.withdrawalNonces(rentalId3);
+
+        const signatures1 = await signWithdrawalApproval([signer1, signer2], rentalId, provider1.address, RENTAL_AMOUNT, nonce1);
+        const signatures2 = await signWithdrawalApproval([signer1, signer2], rentalId2, provider1.address, RENTAL_AMOUNT, nonce2);
+        const signatures3 = await signWithdrawalApproval([signer1, signer2], rentalId3, provider1.address, RENTAL_AMOUNT, nonce3);
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).batchWithdrawRental(
+          [rentalId, rentalId2, rentalId3],
+          [RENTAL_AMOUNT, RENTAL_AMOUNT, RENTAL_AMOUNT],
+          [signatures1, signatures2, signatures3]
+        );
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        const totalAmount = RENTAL_AMOUNT * 3n;
+        const expectedCommission = (totalAmount * COMMISSION_5_PERCENT) / 10000n;
+        const expectedProviderAmount = totalAmount - expectedCommission;
+
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(expectedCommission);
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(expectedProviderAmount);
+      });
+
+      it("should handle batch withdrawal with 0% commission", async function () {
+        // Commission defaults to 0
+        const nonce1 = await staking.withdrawalNonces(rentalId);
+        const nonce2 = await staking.withdrawalNonces(rentalId2);
+
+        const signatures1 = await signWithdrawalApproval([signer1, signer2], rentalId, provider1.address, RENTAL_AMOUNT, nonce1);
+        const signatures2 = await signWithdrawalApproval([signer1, signer2], rentalId2, provider1.address, RENTAL_AMOUNT, nonce2);
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).batchWithdrawRental(
+          [rentalId, rentalId2],
+          [RENTAL_AMOUNT, RENTAL_AMOUNT],
+          [signatures1, signatures2]
+        );
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        // No commission - treasury unchanged
+        expect(treasuryBalanceAfter).to.equal(treasuryBalanceBefore);
+        // Provider gets full amount
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(RENTAL_AMOUNT * 2n);
+      });
+
+      it("should handle batch withdrawal with 100% commission", async function () {
+        await staking.connect(admin).setCommission(10000n); // 100%
+
+        const nonce1 = await staking.withdrawalNonces(rentalId);
+        const nonce2 = await staking.withdrawalNonces(rentalId2);
+
+        const signatures1 = await signWithdrawalApproval([signer1, signer2], rentalId, provider1.address, RENTAL_AMOUNT, nonce1);
+        const signatures2 = await signWithdrawalApproval([signer1, signer2], rentalId2, provider1.address, RENTAL_AMOUNT, nonce2);
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).batchWithdrawRental(
+          [rentalId, rentalId2],
+          [RENTAL_AMOUNT, RENTAL_AMOUNT],
+          [signatures1, signatures2]
+        );
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        // Treasury gets full amount
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(RENTAL_AMOUNT * 2n);
+        // Provider gets nothing
+        expect(providerBalanceAfter).to.equal(providerBalanceBefore);
+      });
+
+      it("should handle partial batch withdrawal with commission", async function () {
+        await staking.connect(admin).setCommission(COMMISSION_10_PERCENT);
+        const halfAmount = RENTAL_AMOUNT / 2n;
+
+        const nonce1 = await staking.withdrawalNonces(rentalId);
+        const nonce2 = await staking.withdrawalNonces(rentalId2);
+
+        const signatures1 = await signWithdrawalApproval([signer1, signer2], rentalId, provider1.address, halfAmount, nonce1);
+        const signatures2 = await signWithdrawalApproval([signer1, signer2], rentalId2, provider1.address, halfAmount, nonce2);
+
+        const treasuryBalanceBefore = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceBefore = await tlpToken.balanceOf(provider1.address);
+
+        await staking.connect(provider1).batchWithdrawRental(
+          [rentalId, rentalId2],
+          [halfAmount, halfAmount],
+          [signatures1, signatures2]
+        );
+
+        const treasuryBalanceAfter = await tlpToken.balanceOf(treasury.address);
+        const providerBalanceAfter = await tlpToken.balanceOf(provider1.address);
+
+        const totalAmount = halfAmount * 2n;
+        const expectedCommission = (totalAmount * COMMISSION_10_PERCENT) / 10000n;
+        const expectedProviderAmount = totalAmount - expectedCommission;
+
+        expect(treasuryBalanceAfter - treasuryBalanceBefore).to.equal(expectedCommission);
+        expect(providerBalanceAfter - providerBalanceBefore).to.equal(expectedProviderAmount);
+      });
+    });
+  });
+
   describe("Edge Cases", function () {
     it("should handle provider withdrawal of partial rental after partial refund", async function () {
       await staking.connect(provider1).stake(STAKE_AMOUNT, MIN_STAKE_DURATION);
