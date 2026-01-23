@@ -11,17 +11,13 @@ export interface ProviderInfo {
 }
 
 /**
- * Rental record for VM resource usage
+ * Claim request structure for batch claims
  */
-export interface Rental {
+export interface ClaimRequest {
+  rentalId: string;
   user: string;
-  provider: string;
   amount: bigint;
-  timestamp: bigint;
-  vm: string;
-  duration: bigint;
-  withdrawnAmount: bigint;
-  refundedAmount: bigint;
+  deadline: bigint;
 }
 
 /**
@@ -38,63 +34,49 @@ export interface TLPStakingDomain extends TypedDataDomain {
  * EIP712 type definitions for signature operations
  */
 export const EIP712_TYPES: Record<string, TypedDataField[]> = {
-  RentalApproval: [
-    { name: "rentalId", type: "bytes32" },
-    { name: "user", type: "address" },
-    { name: "provider", type: "address" },
-    { name: "vm", type: "bytes32" },
-    { name: "duration", type: "uint256" },
-    { name: "nonce", type: "uint256" },
-  ],
-  WithdrawalApproval: [
-    { name: "rentalId", type: "bytes32" },
-    { name: "provider", type: "address" },
-    { name: "amount", type: "uint256" },
-    { name: "nonce", type: "uint256" },
-  ],
-  RefundApproval: [
-    { name: "rentalId", type: "bytes32" },
+  Withdrawal: [
     { name: "user", type: "address" },
     { name: "amount", type: "uint256" },
     { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" },
+  ],
+  Claim: [
+    { name: "rentalId", type: "bytes32" },
+    { name: "user", type: "address" },
+    { name: "provider", type: "address" },
+    { name: "amount", type: "uint256" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" },
   ],
 };
 
 /**
- * Rental approval data for EIP712 signing
+ * Withdrawal data for EIP712 signing
  */
-export interface RentalApprovalData {
-  rentalId: string;
-  user: string;
-  provider: string;
-  vm: string;
-  duration: bigint;
-  nonce: bigint;
-}
-
-/**
- * Withdrawal approval data for EIP712 signing
- */
-export interface WithdrawalApprovalData {
-  rentalId: string;
-  provider: string;
-  amount: bigint;
-  nonce: bigint;
-}
-
-/**
- * Refund approval data for EIP712 signing
- */
-export interface RefundApprovalData {
-  rentalId: string;
+export interface WithdrawalData {
   user: string;
   amount: bigint;
   nonce: bigint;
+  deadline: bigint;
+}
+
+/**
+ * Claim data for EIP712 signing
+ */
+export interface ClaimData {
+  rentalId: string;
+  user: string;
+  provider: string;
+  amount: bigint;
+  nonce: bigint;
+  deadline: bigint;
 }
 
 /**
  * Event types emitted by the contract
  */
+
+// Provider staking events
 export interface StakedEvent {
   provider: string;
   amount: bigint;
@@ -118,28 +100,6 @@ export interface StakeWithdrawnEvent {
   amount: bigint;
 }
 
-export interface RentalCreatedEvent {
-  user: string;
-  provider: string;
-  rentalId: string;
-  amount: bigint;
-  vm: string;
-  duration: bigint;
-}
-
-export interface RentalWithdrawnEvent {
-  provider: string;
-  rentalId: string;
-  amount: bigint;
-}
-
-export interface RefundClaimedEvent {
-  user: string;
-  provider: string;
-  rentalId: string;
-  amount: bigint;
-}
-
 export interface ProviderSlashedEvent {
   provider: string;
   slashedStake: bigint;
@@ -150,6 +110,29 @@ export interface ProviderUnbannedEvent {
   provider: string;
 }
 
+// User balance events
+export interface DepositedEvent {
+  user: string;
+  amount: bigint;
+  newBalance: bigint;
+}
+
+export interface WithdrawnEvent {
+  user: string;
+  amount: bigint;
+  newBalance: bigint;
+}
+
+// Claim event
+export interface ClaimedEvent {
+  rentalId: string;
+  user: string;
+  provider: string;
+  amount: bigint;
+  commission: bigint;
+}
+
+// Admin events
 export interface SignerAddedEvent {
   signer: string;
 }
@@ -158,23 +141,22 @@ export interface SignerRemovedEvent {
   signer: string;
 }
 
-export interface RequiredRentalSignaturesUpdatedEvent {
+export interface RequiredSignaturesUpdatedEvent {
   oldRequired: bigint;
   newRequired: bigint;
 }
 
-export interface RequiredWithdrawalSignaturesUpdatedEvent {
-  oldRequired: bigint;
-  newRequired: bigint;
+export interface CommissionUpdatedEvent {
+  oldCommission: bigint;
+  newCommission: bigint;
 }
 
-export interface RequiredRefundSignaturesUpdatedEvent {
-  oldRequired: bigint;
-  newRequired: bigint;
+export interface TreasuryUpdatedEvent {
+  oldTreasury: string;
+  newTreasury: string;
 }
 
-export interface VmPriceUpdatedEvent {
-  vm: string;
-  oldPrice: bigint;
-  newPrice: bigint;
+export interface MinStakeDurationUpdatedEvent {
+  oldDuration: bigint;
+  newDuration: bigint;
 }

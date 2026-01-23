@@ -6,7 +6,7 @@ import {
   EventLog,
   Log,
 } from "ethers";
-import type { ProviderInfo, Rental, RentalCreatedEvent } from "./types";
+import type { ProviderInfo, ClaimRequest, ClaimedEvent, DepositedEvent, WithdrawnEvent } from "./types";
 import { TLPStakingSigner } from "./TLPStakingSigner";
 
 // ABI for the TLPStaking contract (minimal interface for client operations)
@@ -15,24 +15,16 @@ const TLP_STAKING_ABI = [
   "function tlpToken() view returns (address)",
   "function treasury() view returns (address)",
   "function minStakeDuration() view returns (uint256)",
-  "function rentalGracePeriod() view returns (uint256)",
+  "function commissionBps() view returns (uint256)",
   "function providers(address) view returns (uint256 stakeAmount, uint256 unlockTime, bool isBanned, uint256 slashCount)",
-  "function vmPricePerSecond(bytes32) view returns (uint256)",
-  "function rentals(bytes32) view returns (address user, address provider, uint256 amount, uint256 timestamp, bytes32 vm, uint256 duration, uint256 withdrawnAmount, uint256 refundedAmount)",
-  "function userRentals(address, uint256) view returns (bytes32)",
-  "function providerRentals(address, uint256) view returns (bytes32)",
+  "function userBalances(address) view returns (uint256)",
+  "function nonces(address) view returns (uint256)",
   "function isSigner(address) view returns (bool)",
   "function signers(uint256) view returns (address)",
-  "function requiredRentalSignatures() view returns (uint256)",
-  "function requiredWithdrawalSignatures() view returns (uint256)",
-  "function requiredRefundSignatures() view returns (uint256)",
-  "function rentalNonces(address) view returns (uint256)",
-  "function withdrawalNonces(bytes32) view returns (uint256)",
-  "function refundNonces(bytes32) view returns (uint256)",
+  "function requiredSignatures() view returns (uint256)",
   "function getProviderInfo(address) view returns (uint256 stakeAmount, uint256 unlockTime, bool isBanned, uint256 slashCount)",
-  "function getRental(bytes32) view returns (tuple(address user, address provider, uint256 amount, uint256 timestamp, bytes32 vm, uint256 duration, uint256 withdrawnAmount, uint256 refundedAmount))",
-  "function getUserRentals(address) view returns (bytes32[])",
-  "function getProviderRentals(address) view returns (bytes32[])",
+  "function getUserBalance(address) view returns (uint256)",
+  "function getNonce(address) view returns (uint256)",
   "function isProviderActive(address) view returns (bool)",
   "function getSigners() view returns (address[])",
   "function getSignerCount() view returns (uint256)",
@@ -42,30 +34,27 @@ const TLP_STAKING_ABI = [
   "function DEFAULT_ADMIN_ROLE() view returns (bytes32)",
   "function POLICE_ROLE() view returns (bytes32)",
 
-  // Write functions - Provider
+  // Write functions - User Balance
+  "function deposit(uint256 amount)",
+  "function withdraw(uint256 amount, uint256 deadline, bytes[] signatures)",
+
+  // Write functions - Provider Claim
+  "function claim(bytes32 rentalId, address user, uint256 amount, uint256 deadline, bytes[] signatures)",
+  "function batchClaim(tuple(bytes32 rentalId, address user, uint256 amount, uint256 deadline)[] claims, bytes[][] signatures)",
+
+  // Write functions - Provider Staking
   "function stake(uint256 amount, uint256 duration)",
   "function extendStakeDuration(uint256 newUnlockTime)",
   "function increaseStake(uint256 amount)",
   "function withdrawStake()",
 
-  // Write functions - User
-  "function rentFromProvider(bytes32 rentalId, address provider, bytes32 vm, uint256 duration, bytes[] signatures)",
-  "function claimRefund(bytes32 rentalId, uint256 amount, bytes[] signatures)",
-
-  // Write functions - Provider withdrawal
-  "function withdrawRental(bytes32 rentalId, uint256 amount, bytes[] signatures)",
-  "function batchWithdrawRental(bytes32[] rentalIds, uint256[] amounts, bytes[][] signatures)",
-
   // Admin functions
   "function addSigner(address signer)",
   "function removeSigner(address signer)",
-  "function setRequiredRentalSignatures(uint256 _required)",
-  "function setRequiredWithdrawalSignatures(uint256 _required)",
-  "function setRequiredRefundSignatures(uint256 _required)",
+  "function setRequiredSignatures(uint256 _required)",
   "function setMinStakeDuration(uint256 newDuration)",
-  "function setRentalGracePeriod(uint256 newPeriod)",
   "function setTreasury(address newTreasury)",
-  "function setVmPrice(bytes32 vm, uint256 pricePerSecond)",
+  "function setCommission(uint256 newCommissionBps)",
   "function grantRole(bytes32 role, address account)",
   "function revokeRole(bytes32 role, address account)",
 
@@ -79,18 +68,17 @@ const TLP_STAKING_ABI = [
   "event StakeExtended(address indexed provider, uint256 newUnlockTime)",
   "event StakeIncreased(address indexed provider, uint256 addedAmount, uint256 newTotal, uint256 newUnlockTime)",
   "event StakeWithdrawn(address indexed provider, uint256 amount)",
-  "event RentalCreated(address indexed user, address indexed provider, bytes32 indexed rentalId, uint256 amount, bytes32 vm, uint256 duration)",
-  "event RentalWithdrawn(address indexed provider, bytes32 indexed rentalId, uint256 amount)",
-  "event RefundClaimed(address indexed user, address indexed provider, bytes32 indexed rentalId, uint256 amount)",
+  "event Deposited(address indexed user, uint256 amount, uint256 newBalance)",
+  "event Withdrawn(address indexed user, uint256 amount, uint256 newBalance)",
+  "event Claimed(bytes32 indexed rentalId, address indexed user, address indexed provider, uint256 amount, uint256 commission)",
   "event ProviderSlashed(address indexed provider, uint256 slashedStake, bool banned)",
   "event ProviderUnbanned(address indexed provider)",
   "event SignerAdded(address indexed signer)",
   "event SignerRemoved(address indexed signer)",
-  "event RequiredRentalSignaturesUpdated(uint256 oldRequired, uint256 newRequired)",
-  "event RequiredWithdrawalSignaturesUpdated(uint256 oldRequired, uint256 newRequired)",
-  "event RequiredRefundSignaturesUpdated(uint256 oldRequired, uint256 newRequired)",
-  "event VmPriceUpdated(bytes32 indexed vm, uint256 oldPrice, uint256 newPrice)",
-  "event RentalGracePeriodUpdated(uint256 oldPeriod, uint256 newPeriod)",
+  "event RequiredSignaturesUpdated(uint256 oldRequired, uint256 newRequired)",
+  "event CommissionUpdated(uint256 oldCommission, uint256 newCommission)",
+  "event TreasuryUpdated(address oldTreasury, address newTreasury)",
+  "event MinStakeDurationUpdated(uint256 oldDuration, uint256 newDuration)",
 ];
 
 /**
@@ -157,6 +145,24 @@ export class TLPStakingClient {
     return new TLPStakingSigner(signer, this.address, chainId);
   }
 
+  // ============ Read Methods - User Balance ============
+
+  /**
+   * Get user's balance in the pool
+   * @param user - User address
+   */
+  async getUserBalance(user: string): Promise<bigint> {
+    return this.contract.getUserBalance(user);
+  }
+
+  /**
+   * Get current nonce for an address
+   * @param account - Account address
+   */
+  async getNonce(account: string): Promise<bigint> {
+    return this.contract.getNonce(account);
+  }
+
   // ============ Read Methods - Provider ============
 
   /**
@@ -175,62 +181,6 @@ export class TLPStakingClient {
    */
   async isProviderActive(provider: string): Promise<boolean> {
     return this.contract.isProviderActive(provider);
-  }
-
-  // ============ Read Methods - Rentals ============
-
-  /**
-   * Get rental details by ID
-   * @param rentalId - Rental ID (bytes32)
-   */
-  async getRental(rentalId: string): Promise<Rental> {
-    const result = await this.contract.getRental(rentalId);
-    return {
-      user: result.user,
-      provider: result.provider,
-      amount: result.amount,
-      timestamp: result.timestamp,
-      vm: result.vm,
-      duration: result.duration,
-      withdrawnAmount: result.withdrawnAmount,
-      refundedAmount: result.refundedAmount,
-    };
-  }
-
-  /**
-   * Get all rental IDs for a user
-   * @param user - User address
-   */
-  async getUserRentals(user: string): Promise<string[]> {
-    return this.contract.getUserRentals(user);
-  }
-
-  /**
-   * Get all rental IDs received by a provider
-   * @param provider - Provider address
-   */
-  async getProviderRentals(provider: string): Promise<string[]> {
-    return this.contract.getProviderRentals(provider);
-  }
-
-  // ============ Read Methods - VM Pricing ============
-
-  /**
-   * Get price per second for a VM type
-   * @param vm - VM type identifier (bytes32)
-   */
-  async getVmPrice(vm: string): Promise<bigint> {
-    return this.contract.vmPricePerSecond(vm);
-  }
-
-  /**
-   * Calculate rental amount for a VM rental
-   * @param vm - VM type identifier (bytes32)
-   * @param duration - Duration in seconds
-   */
-  async calculateRentalAmount(vm: string, duration: bigint): Promise<bigint> {
-    const pricePerSecond = await this.getVmPrice(vm);
-    return pricePerSecond * duration;
   }
 
   // ============ Read Methods - Signers ============
@@ -258,50 +208,10 @@ export class TLPStakingClient {
   }
 
   /**
-   * Get number of required signatures for rentals
+   * Get number of required signatures
    */
-  async getRequiredRentalSignatures(): Promise<bigint> {
-    return this.contract.requiredRentalSignatures();
-  }
-
-  /**
-   * Get number of required signatures for withdrawals
-   */
-  async getRequiredWithdrawalSignatures(): Promise<bigint> {
-    return this.contract.requiredWithdrawalSignatures();
-  }
-
-  /**
-   * Get number of required signatures for refunds
-   */
-  async getRequiredRefundSignatures(): Promise<bigint> {
-    return this.contract.requiredRefundSignatures();
-  }
-
-  // ============ Read Methods - Nonces ============
-
-  /**
-   * Get rental nonce for a user
-   * @param user - User address
-   */
-  async getRentalNonce(user: string): Promise<bigint> {
-    return this.contract.rentalNonces(user);
-  }
-
-  /**
-   * Get withdrawal nonce for a rental
-   * @param rentalId - Rental ID (bytes32)
-   */
-  async getWithdrawalNonce(rentalId: string): Promise<bigint> {
-    return this.contract.withdrawalNonces(rentalId);
-  }
-
-  /**
-   * Get refund nonce for a rental
-   * @param rentalId - Rental ID (bytes32)
-   */
-  async getRefundNonce(rentalId: string): Promise<bigint> {
-    return this.contract.refundNonces(rentalId);
+  async getRequiredSignatures(): Promise<bigint> {
+    return this.contract.requiredSignatures();
   }
 
   // ============ Read Methods - Config ============
@@ -314,10 +224,10 @@ export class TLPStakingClient {
   }
 
   /**
-   * Get rental grace period
+   * Get commission rate in basis points
    */
-  async getRentalGracePeriod(): Promise<bigint> {
-    return this.contract.rentalGracePeriod();
+  async getCommissionBps(): Promise<bigint> {
+    return this.contract.commissionBps();
   }
 
   /**
@@ -366,6 +276,62 @@ export class TLPStakingClient {
     return this.contract.DEFAULT_ADMIN_ROLE();
   }
 
+  // ============ Write Methods - User Balance ============
+
+  /**
+   * Deposit tokens to user's balance in the pool
+   * @param amount - Amount of tokens to deposit
+   */
+  async deposit(amount: bigint): Promise<ContractTransactionResponse> {
+    return this.contract.deposit(amount);
+  }
+
+  /**
+   * Withdraw tokens from user's balance (requires k-of-n signatures)
+   * @param amount - Amount to withdraw
+   * @param deadline - Signature expiration timestamp
+   * @param signatures - Array of EIP712 signatures from authorized signers
+   */
+  async withdraw(
+    amount: bigint,
+    deadline: bigint,
+    signatures: string[]
+  ): Promise<ContractTransactionResponse> {
+    return this.contract.withdraw(amount, deadline, signatures);
+  }
+
+  // ============ Write Methods - Provider Claim ============
+
+  /**
+   * Provider claims from a user's balance (requires k-of-n signatures)
+   * @param rentalId - Rental ID for audit trail (bytes32)
+   * @param user - Address of the user to claim from
+   * @param amount - Amount to claim
+   * @param deadline - Signature expiration timestamp
+   * @param signatures - Array of EIP712 signatures from authorized signers
+   */
+  async claim(
+    rentalId: string,
+    user: string,
+    amount: bigint,
+    deadline: bigint,
+    signatures: string[]
+  ): Promise<ContractTransactionResponse> {
+    return this.contract.claim(rentalId, user, amount, deadline, signatures);
+  }
+
+  /**
+   * Provider claims from multiple users in a single transaction
+   * @param claims - Array of claim requests
+   * @param signatures - Array of signature arrays for each claim
+   */
+  async batchClaim(
+    claims: ClaimRequest[],
+    signatures: string[][]
+  ): Promise<ContractTransactionResponse> {
+    return this.contract.batchClaim(claims, signatures);
+  }
+
   // ============ Write Methods - Provider Staking ============
 
   /**
@@ -405,70 +371,6 @@ export class TLPStakingClient {
     return this.contract.withdrawStake();
   }
 
-  // ============ Write Methods - User Rentals ============
-
-  /**
-   * Rent VM resources from a provider
-   * @param rentalId - Unique rental ID (bytes32, generated by backend)
-   * @param provider - Provider address
-   * @param vm - VM type identifier (bytes32)
-   * @param duration - Duration in seconds
-   * @param signatures - Array of EIP712 signatures from authorized signers
-   */
-  async rentFromProvider(
-    rentalId: string,
-    provider: string,
-    vm: string,
-    duration: bigint,
-    signatures: string[]
-  ): Promise<ContractTransactionResponse> {
-    return this.contract.rentFromProvider(rentalId, provider, vm, duration, signatures);
-  }
-
-  /**
-   * Claim refund for a rental
-   * @param rentalId - Rental ID (bytes32)
-   * @param amount - Amount to refund (must match signed amount)
-   * @param signatures - Array of EIP712 signatures from authorized signers
-   */
-  async claimRefund(
-    rentalId: string,
-    amount: bigint,
-    signatures: string[]
-  ): Promise<ContractTransactionResponse> {
-    return this.contract.claimRefund(rentalId, amount, signatures);
-  }
-
-  // ============ Write Methods - Provider Withdrawal ============
-
-  /**
-   * Withdraw rental proceeds (as provider)
-   * @param rentalId - Rental ID (bytes32)
-   * @param amount - Amount to withdraw (must match signed amount)
-   * @param signatures - Array of EIP712 signatures from authorized signers
-   */
-  async withdrawRental(
-    rentalId: string,
-    amount: bigint,
-    signatures: string[]
-  ): Promise<ContractTransactionResponse> {
-    return this.contract.withdrawRental(rentalId, amount, signatures);
-  }
-
-  /**
-   * Batch withdraw from multiple rentals in a single transaction
-   * @param rentalIds - Array of rental IDs (bytes32)
-   * @param amounts - Array of amounts to withdraw from each rental
-   * @param signatures - Array of signature arrays for each withdrawal
-   */
-  async batchWithdrawRental(
-    rentalIds: string[],
-    amounts: bigint[],
-    signatures: string[][]
-  ): Promise<ContractTransactionResponse> {
-    return this.contract.batchWithdrawRental(rentalIds, amounts, signatures);
-  }
-
   // ============ Admin Methods ============
 
   /**
@@ -488,27 +390,11 @@ export class TLPStakingClient {
   }
 
   /**
-   * Set the number of required signatures for rentals
+   * Set the number of required signatures
    * @param k - Number of required signatures
    */
-  async setRequiredRentalSignatures(k: bigint): Promise<ContractTransactionResponse> {
-    return this.contract.setRequiredRentalSignatures(k);
-  }
-
-  /**
-   * Set the number of required signatures for withdrawals
-   * @param k - Number of required signatures
-   */
-  async setRequiredWithdrawalSignatures(k: bigint): Promise<ContractTransactionResponse> {
-    return this.contract.setRequiredWithdrawalSignatures(k);
-  }
-
-  /**
-   * Set the number of required signatures for refunds
-   * @param k - Number of required signatures
-   */
-  async setRequiredRefundSignatures(k: bigint): Promise<ContractTransactionResponse> {
-    return this.contract.setRequiredRefundSignatures(k);
+  async setRequiredSignatures(k: bigint): Promise<ContractTransactionResponse> {
+    return this.contract.setRequiredSignatures(k);
   }
 
   /**
@@ -522,16 +408,6 @@ export class TLPStakingClient {
   }
 
   /**
-   * Update rental grace period
-   * @param period - New grace period in seconds
-   */
-  async setRentalGracePeriod(
-    period: bigint
-  ): Promise<ContractTransactionResponse> {
-    return this.contract.setRentalGracePeriod(period);
-  }
-
-  /**
    * Update treasury address
    * @param treasury - New treasury address
    */
@@ -540,15 +416,13 @@ export class TLPStakingClient {
   }
 
   /**
-   * Set price per second for a VM type
-   * @param vm - VM type identifier (bytes32)
-   * @param pricePerSecond - Price per second in wei
+   * Set commission rate for provider claims
+   * @param commissionBps - Commission in basis points (10000 = 100%)
    */
-  async setVmPrice(
-    vm: string,
-    pricePerSecond: bigint
+  async setCommission(
+    commissionBps: bigint
   ): Promise<ContractTransactionResponse> {
-    return this.contract.setVmPrice(vm, pricePerSecond);
+    return this.contract.setCommission(commissionBps);
   }
 
   /**
@@ -608,27 +482,76 @@ export class TLPStakingClient {
   // ============ Event Parsing Helpers ============
 
   /**
-   * Parse RentalCreated event from transaction receipt
+   * Parse Deposited event from transaction receipt
    * @param logs - Transaction logs
-   * @returns RentalCreated event data or null if not found
+   * @returns Deposited event data or null if not found
    */
-  parseRentalCreatedEvent(
-    logs: (Log | EventLog)[]
-  ): RentalCreatedEvent | null {
+  parseDepositedEvent(logs: (Log | EventLog)[]): DepositedEvent | null {
     for (const log of logs) {
       try {
         const parsed = this.contract.interface.parseLog({
           topics: log.topics as string[],
           data: log.data,
         });
-        if (parsed?.name === "RentalCreated") {
+        if (parsed?.name === "Deposited") {
           return {
             user: parsed.args[0],
-            provider: parsed.args[1],
-            rentalId: parsed.args[2],
+            amount: parsed.args[1],
+            newBalance: parsed.args[2],
+          };
+        }
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Parse Withdrawn event from transaction receipt
+   * @param logs - Transaction logs
+   * @returns Withdrawn event data or null if not found
+   */
+  parseWithdrawnEvent(logs: (Log | EventLog)[]): WithdrawnEvent | null {
+    for (const log of logs) {
+      try {
+        const parsed = this.contract.interface.parseLog({
+          topics: log.topics as string[],
+          data: log.data,
+        });
+        if (parsed?.name === "Withdrawn") {
+          return {
+            user: parsed.args[0],
+            amount: parsed.args[1],
+            newBalance: parsed.args[2],
+          };
+        }
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Parse Claimed event from transaction receipt
+   * @param logs - Transaction logs
+   * @returns Claimed event data or null if not found
+   */
+  parseClaimedEvent(logs: (Log | EventLog)[]): ClaimedEvent | null {
+    for (const log of logs) {
+      try {
+        const parsed = this.contract.interface.parseLog({
+          topics: log.topics as string[],
+          data: log.data,
+        });
+        if (parsed?.name === "Claimed") {
+          return {
+            rentalId: parsed.args[0],
+            user: parsed.args[1],
+            provider: parsed.args[2],
             amount: parsed.args[3],
-            vm: parsed.args[4],
-            duration: parsed.args[5],
+            commission: parsed.args[4],
           };
         }
       } catch {

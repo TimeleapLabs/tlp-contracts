@@ -25,8 +25,8 @@ This document describes the technical architecture of the TLPStaking system.
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │                        TLPStaking Contract                       │   │
 │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │   │
-│  │  │ Staking  │ │ Rentals  │ │  Signer  │ │  Police  │           │   │
-│  │  │  Logic   │ │  Logic   │ │  Verify  │ │  Logic   │           │   │
+│  │  │ Staking  │ │   Pool   │ │  Signer  │ │  Police  │           │   │
+│  │  │  Logic   │ │  Escrow  │ │  Verify  │ │  Logic   │           │   │
 │  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
@@ -34,6 +34,17 @@ This document describes the technical architecture of the TLPStaking system.
 │  └─────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Core Design Principle
+
+**Contract = Pool-based escrow. All business logic lives off-chain.**
+
+- Funds flow INTO the pool via user deposits (no signature required)
+- Funds flow OUT of the pool only with k-of-n backend signatures
+- No assignment of funds to specific providers or rentals on-chain
+- Rental IDs in events only (for audit trail)
+
+This design enables seamless provider migration: when a provider goes down, the backend can authorize claims from a different provider without any on-chain refund/re-rental logic.
 
 ## Contract Architecture
 
@@ -60,27 +71,23 @@ This document describes the technical architecture of the TLPStaking system.
 IERC20 public immutable tlpToken;
 address public treasury;
 
+// User Balance Pool
+mapping(address => uint256) public userBalances;
+
+// Single nonce per address (for replay protection)
+mapping(address => uint256) public nonces;
+
 // Provider State
 mapping(address => ProviderInfo) public providers;
 uint256 public minStakeDuration = 30 days;
 
-// Rental State
-mapping(bytes32 => Rental) public rentals;
-mapping(address => bytes32[]) public userRentals;
-mapping(address => bytes32[]) public providerRentals;
-mapping(bytes32 => uint256) public vmPricePerSecond;
-
 // Signer State
 mapping(address => bool) public isSigner;
 address[] public signers;
-uint256 public requiredRentalSignatures;
-uint256 public requiredWithdrawalSignatures;
-uint256 public requiredRefundSignatures;
+uint256 public requiredSignatures;
 
-// Nonce State (Replay Protection)
-mapping(address => uint256) public rentalNonces;      // per-user
-mapping(bytes32 => uint256) public withdrawalNonces;  // per-rental
-mapping(bytes32 => uint256) public refundNonces;      // per-rental
+// Commission
+uint256 public commissionBps;  // Basis points (10000 = 100%)
 ```
 
 ### Data Structures
@@ -90,17 +97,14 @@ struct ProviderInfo {
     uint256 stakeAmount;    // Total staked TLP
     uint256 unlockTime;     // Timestamp when stake unlocks
     bool isBanned;          // Whether provider is banned
+    uint256 slashCount;     // Number of times slashed
 }
 
-struct Rental {
-    address user;           // User who rented
-    address provider;       // Provider who served
-    uint256 amount;         // Original rental amount
-    uint256 timestamp;      // When rental was created
-    bytes32 vm;             // VM type identifier
-    uint256 duration;       // Rental duration in seconds
-    uint256 withdrawnAmount; // Total withdrawn by provider
-    uint256 refundedAmount;  // Total refunded to user
+struct ClaimRequest {
+    bytes32 rentalId;       // For audit trail (not stored on-chain)
+    address user;           // User to claim from
+    uint256 amount;         // Amount to claim
+    uint256 deadline;       // Signature expiration
 }
 ```
 
@@ -123,16 +127,14 @@ Domain Separator:
 ### Type Hashes
 
 ```solidity
-RENTAL_TYPEHASH = keccak256(
-    "RentalApproval(bytes32 rentalId,address user,address provider,bytes32 vm,uint256 duration,uint256 nonce)"
-);
-
+// User withdrawing their balance
 WITHDRAWAL_TYPEHASH = keccak256(
-    "WithdrawalApproval(bytes32 rentalId,address provider,uint256 amount,uint256 nonce)"
+    "Withdrawal(address user,uint256 amount,uint256 nonce,uint256 deadline)"
 );
 
-REFUND_TYPEHASH = keccak256(
-    "RefundApproval(bytes32 rentalId,address user,uint256 amount,uint256 nonce)"
+// Provider claiming from user's balance
+CLAIM_TYPEHASH = keccak256(
+    "Claim(bytes32 rentalId,address user,address provider,uint256 amount,uint256 nonce,uint256 deadline)"
 );
 ```
 
@@ -155,9 +157,10 @@ REFUND_TYPEHASH = keccak256(
 
 | Action | Nonce Source | Purpose |
 |--------|--------------|---------|
-| Rental | Per-user (`rentalNonces[user]`) | Prevent replay of same rental request |
-| Withdrawal | Per-rental (`withdrawalNonces[rentalId]`) | Allow multiple partial withdrawals |
-| Refund | Per-rental (`refundNonces[rentalId]`) | Allow multiple partial refunds |
+| Withdrawal | Per-user (`nonces[user]`) | Prevent replay of withdrawal requests |
+| Claim | Per-provider (`nonces[provider]`) | Prevent replay of claim requests |
+
+Each signature also includes a `deadline` parameter for time-based expiration.
 
 ## Access Control
 
@@ -168,7 +171,7 @@ DEFAULT_ADMIN_ROLE (0x00)
 ├── Can grant/revoke all roles
 ├── Can manage signers
 ├── Can configure signature requirements
-├── Can set VM prices
+├── Can set commission rate
 ├── Can update treasury
 ├── Can update min stake duration
 └── Can unban providers
@@ -195,45 +198,82 @@ POLICE_ROLE
 
 ## Financial Flows
 
-### Rental Payment Flow
+### Pool-Based Fund Flow
 
 ```
-User                    Contract                Provider
-  │                        │                        │
-  │─── approve(TLP) ──────►│                        │
-  │                        │                        │
-  │─── rentFromProvider ──►│                        │
-  │    (with signatures)   │                        │
-  │                        │◄─── transferFrom ─────►│
-  │                        │     (TLP locked)       │
-  │                        │                        │
-  │◄── RentalCreated ──────│                        │
+                    ┌─────────────────────┐
+                    │   Contract Pool     │
+                    │   (holds all TLP)   │
+                    └─────────────────────┘
+                           ▲    │
+          deposit()        │    │  withdraw() [k-of-n sig]
+          (no sig)         │    │  claim() [k-of-n sig]
+                           │    ▼
+┌──────────┐         ┌─────────────┐         ┌──────────────┐
+│  Users   │ ───────►│   Backend   │◄─────── │  Providers   │
+└──────────┘         │  (off-chain │         └──────────────┘
+                     │   logic)    │
+                     └─────────────┘
 ```
 
-### Withdrawal Flow
+### Deposit Flow (No Signature Required)
 
 ```
-Provider                Contract                Treasury
-    │                       │                       │
-    │── withdrawRental ────►│                       │
-    │   (with signatures)   │                       │
-    │                       │                       │
-    │◄── transfer(TLP) ─────│                       │
-    │                       │                       │
-    │◄── RentalWithdrawn ───│                       │
+User                    Contract
+  │                        │
+  │─── approve(TLP) ──────►│
+  │                        │
+  │─── deposit(amount) ───►│
+  │                        │
+  │                        │◄─── transferFrom(user, contract)
+  │                        │
+  │◄── Deposited event ────│
 ```
 
-### Refund Flow
+### Withdrawal Flow (Requires k-of-n Signatures)
 
 ```
-User                    Contract                Provider
+User                    Backend                 Contract
   │                        │                        │
-  │─── claimRefund ───────►│                        │
-  │    (with signatures)   │                        │
+  │── Request withdrawal ─►│                        │
   │                        │                        │
-  │◄── transfer(TLP) ──────│                        │
+  │                        │─── Get nonce ─────────►│
+  │                        │◄────── nonce ──────────│
   │                        │                        │
-  │◄── RefundClaimed ──────│                        │
+  │                        │─── Sign EIP712 ───────►│
+  │                        │    (k-of-n signers)    │
+  │                        │                        │
+  │◄── signatures ─────────│                        │
+  │                        │                        │
+  │── withdraw(amount, deadline, signatures) ──────►│
+  │                        │                        │
+  │◄── transfer(TLP) ──────│────────────────────────│
+  │                        │                        │
+  │◄── Withdrawn event ────│────────────────────────│
+```
+
+### Provider Claim Flow (Requires k-of-n Signatures)
+
+```
+Provider                Backend                 Contract         Treasury
+    │                      │                        │                │
+    │── Request claim ────►│                        │                │
+    │   (rentalId, user,   │                        │                │
+    │    amount)           │                        │                │
+    │                      │─── Get provider nonce ►│                │
+    │                      │◄────── nonce ──────────│                │
+    │                      │                        │                │
+    │                      │─── Sign EIP712 ───────►│                │
+    │                      │    (k-of-n signers)    │                │
+    │                      │                        │                │
+    │◄── signatures ───────│                        │                │
+    │                      │                        │                │
+    │── claim(rentalId, user, amount, deadline, signatures) ───────►│
+    │                      │                        │                │
+    │                      │                        │─── commission ►│
+    │◄── transfer(TLP - commission) ───────────────│                │
+    │                      │                        │                │
+    │◄── Claimed event ────│────────────────────────│                │
 ```
 
 ### Slashing Flow
@@ -256,9 +296,10 @@ All functions that transfer tokens use the `nonReentrant` modifier:
 - `stake()`
 - `increaseStake()`
 - `withdrawStake()`
-- `rentFromProvider()`
-- `claimRefund()`
-- `withdrawRental()`
+- `deposit()`
+- `withdraw()`
+- `claim()`
+- `batchClaim()`
 - `slashAndBan()`
 - `slashPartial()`
 
@@ -266,8 +307,9 @@ All functions that transfer tokens use the `nonReentrant` modifier:
 
 1. **Domain Separation**: EIP712 domain includes contract address and chain ID
 2. **Nonce Protection**: Each signature is tied to a specific nonce
-3. **Duplicate Prevention**: Same signer cannot be used twice in one operation
-4. **Signer Validation**: Only registered signers can produce valid signatures
+3. **Deadline Expiration**: Signatures expire after the specified deadline
+4. **Duplicate Prevention**: Same signer cannot be used twice in one operation
+5. **Signer Validation**: Only registered signers can produce valid signatures
 
 ### Access Control Security
 
@@ -278,7 +320,7 @@ All functions that transfer tokens use the `nonReentrant` modifier:
 ### Token Safety
 
 1. **SafeERC20**: All token transfers use SafeERC20 wrapper
-2. **Balance Checks**: Withdrawal/refund amounts validated against available balance
+2. **Balance Checks**: Withdrawal/claim amounts validated against available balance
 3. **No Arbitrary Transfers**: Tokens can only move through defined flows
 
 ## Gas Optimization
@@ -286,18 +328,12 @@ All functions that transfer tokens use the `nonReentrant` modifier:
 ### Storage Layout
 
 ```solidity
-// Packed struct (1 slot for amounts, 1 slot for booleans)
+// Packed struct
 struct ProviderInfo {
     uint256 stakeAmount;    // slot 0
     uint256 unlockTime;     // slot 1
-    bool isBanned;          // slot 2 (1 byte)
-}
-
-// Rental amounts tracked cumulatively (not per-action)
-struct Rental {
-    // ... addresses and amounts in separate slots
-    uint256 withdrawnAmount;  // cumulative, not boolean
-    uint256 refundedAmount;   // cumulative, not boolean
+    bool isBanned;          // slot 2 (packed with slashCount)
+    uint256 slashCount;     // slot 2 continued
 }
 ```
 
@@ -316,6 +352,35 @@ function _verifySignatures(...) internal view {
 }
 ```
 
+### Batch Operations
+
+```solidity
+// batchClaim processes multiple claims with single provider check
+function batchClaim(ClaimRequest[] claims, bytes[][] signatures) external {
+    // Verify provider once (uses _msgSender() for meta-transaction support)
+    _verifyActiveProvider();
+
+    // Process all claims, accumulate totals
+    for (uint256 i = 0; i < claims.length; i++) {
+        // Validate, verify signatures, update balances, calculate commission
+        (uint256 commission, uint256 providerAmount) = _processClaim(...);
+        totalCommission += commission;
+        totalAmount += providerAmount;
+    }
+
+    // Batch token transfers
+    if (totalCommission > 0) {
+        tlpToken.safeTransfer(treasury, totalCommission);
+    }
+    tlpToken.safeTransfer(_msgSender(), totalAmount);
+
+    // Emit events after transfers
+    for (uint256 i = 0; i < claims.length; i++) {
+        emit Claimed(claims[i].rentalId, claims[i].user, _msgSender(), ...);
+    }
+}
+```
+
 ## Deployment Configuration
 
 ### Constructor Parameters
@@ -323,7 +388,7 @@ function _verifySignatures(...) internal view {
 ```solidity
 constructor(
     address _tlpToken,    // TLP ERC20 token address
-    address _treasury,    // Treasury for slashed funds
+    address _treasury,    // Treasury for commissions and slashed funds
     address _admin        // Initial admin address
 )
 ```
@@ -331,6 +396,25 @@ constructor(
 ### Post-Deployment Setup
 
 1. Add authorized signers: `addSigner(signer1)`, `addSigner(signer2)`, etc.
-2. Set signature requirements: `setRequiredRentalSignatures(k)`
-3. Configure VM prices: `setVmPrice(vmId, pricePerSecond)`
+2. Set signature requirements: `setRequiredSignatures(k)`
+3. Set commission rate: `setCommission(commissionBps)` (e.g., 500 for 5%)
 4. Grant police role if needed: `grantRole(POLICE_ROLE, police)`
+
+## Migration Scenario Example
+
+The pool-based architecture enables seamless provider migration:
+
+1. **User deposits 100 TLP** to the pool
+2. **Backend tracks usage off-chain** (no on-chain rental state)
+3. **Provider A serves user**, then goes down
+4. **Backend signs claim** for Provider A: 10 TLP (time used before downtime)
+5. **User migrates to Provider B** (backend handles this)
+6. **Backend signs claim** for Provider B: 10 TLP (continued service)
+7. **User's pool balance**: 80 TLP remaining
+8. **No refunds needed** - unused balance stays in pool
+
+This is much simpler than the old rental-based model which required:
+- On-chain refund for Rental#1 with Provider A
+- User claims refund
+- On-chain new Rental#2 with Provider B
+- Complex partial time accounting

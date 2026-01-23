@@ -10,21 +10,15 @@ export const DEFAULT_ADMIN_ROLE =
 /**
  * EIP712 type hashes (must match contract)
  */
-export const RENTAL_TYPEHASH = keccak256(
-  toUtf8Bytes(
-    "RentalApproval(address user,address provider,bytes32 vm,uint256 duration,uint256 nonce)"
-  )
-);
-
 export const WITHDRAWAL_TYPEHASH = keccak256(
   toUtf8Bytes(
-    "WithdrawalApproval(uint256 rentalId,address provider,uint256 amount,uint256 nonce)"
+    "Withdrawal(address user,uint256 amount,uint256 nonce,uint256 deadline)"
   )
 );
 
-export const REFUND_TYPEHASH = keccak256(
+export const CLAIM_TYPEHASH = keccak256(
   toUtf8Bytes(
-    "RefundApproval(uint256 rentalId,address user,uint256 amount,uint256 nonce)"
+    "Claim(bytes32 rentalId,address user,address provider,uint256 amount,uint256 nonce,uint256 deadline)"
   )
 );
 
@@ -40,3 +34,9 @@ export const ONE_HOUR = 60 * 60;
  */
 export const EIP712_DOMAIN_NAME = "TLPStaking";
 export const EIP712_DOMAIN_VERSION = "1";
+
+/**
+ * Commission constants
+ */
+export const MAX_COMMISSION_BPS = 10000; // 100%
+export const BPS_DENOMINATOR = 10000;

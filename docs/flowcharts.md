@@ -2,9 +2,33 @@
 
 This document contains Mermaid flowcharts illustrating the various user, provider, and system interactions with the TLPStaking smart contracts.
 
-## 1. User Rents a VM
+## 1. User Deposits to Pool
 
-Complete flow from user request through CLI, backend signature generation, and on-chain execution.
+Users deposit TLP tokens into the pool without requiring any signatures.
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as Timeleap CLI
+    participant Contract as TLPStaking Contract
+
+    User->>CLI: Request to deposit TLP
+    CLI->>User: Show deposit interface
+
+    User->>Contract: approve(stakingContract, amount)
+    User->>Contract: deposit(amount)
+
+    Contract->>Contract: Verify amount > 0
+    Contract->>Contract: Transfer TLP from user
+    Contract->>Contract: Update userBalances[user]
+    Contract-->>User: Deposited event
+
+    CLI-->>User: Deposit confirmed<br/>Balance updated
+```
+
+## 2. User Withdraws from Pool
+
+Users withdraw their balance with backend-signed approval.
 
 ```mermaid
 sequenceDiagram
@@ -12,43 +36,31 @@ sequenceDiagram
     participant CLI as Timeleap CLI
     participant Backend as Timeleap Backend
     participant Contract as TLPStaking Contract
-    participant Provider
 
-    User->>CLI: Request to rent VM (type, duration)
-    CLI->>Backend: Find available provider for VM type
-    Backend->>Contract: Query providers (stake, unlockTime, isBanned)
-    Contract-->>Backend: Provider list with status
-    Backend->>Backend: Select best provider<br/>(sufficient stake duration, not banned)
-    Backend-->>CLI: Provider match found
+    User->>CLI: Request to withdraw tokens
+    CLI->>Backend: Request withdrawal approval
 
-    CLI->>Backend: Request rental approval
-    Backend->>Backend: Generate unique rentalId
-    Backend->>Backend: Get user's current nonce
-    Backend->>Backend: Create EIP712 RentalApproval<br/>{rentalId, user, provider, vm, duration, nonce}
-    Backend->>Backend: Sign with k-of-n signers (2 of 3)
-    Backend-->>CLI: Return signatures + rentalId
+    Backend->>Contract: Query nonces[user]
+    Contract-->>Backend: Current nonce
 
-    CLI->>User: Show rental cost (vmPricePerSecond × duration)
-    User->>Contract: approve(stakingContract, amount)
-    User->>Contract: rentFromProvider(rentalId, provider, vm, duration, signatures)
+    Backend->>Backend: Create EIP712 Withdrawal<br/>{user, amount, nonce, deadline}
+    Backend->>Backend: Sign with k-of-n signers
+    Backend-->>CLI: Return signatures + deadline
 
-    Contract->>Contract: Verify signatures (k-of-n)
-    Contract->>Contract: Check rental doesn't exist
-    Contract->>Contract: Check VM price configured
-    Contract->>Contract: Check provider active & not banned
-    Contract->>Contract: Check provider stake duration covers rental + grace
-    Contract->>Contract: Transfer TLP from user
-    Contract->>Contract: Create Rental record
-    Contract-->>User: RentalCreated event
+    CLI-->>User: Show withdrawal details
+    User->>Contract: withdraw(amount, deadline, signatures)
 
-    CLI->>Backend: Submit tx hash for verification
-    Backend->>Contract: Verify transaction success
-    Backend-->>CLI: Rental confirmed
-    CLI->>Provider: Notify: provision VM for user
-    Provider-->>User: VM access credentials
+    Contract->>Contract: Verify deadline not expired
+    Contract->>Contract: Verify k-of-n signatures
+    Contract->>Contract: Check amount <= userBalances[user]
+    Contract->>Contract: Update balance and nonce
+    Contract->>Contract: Transfer TLP to user
+    Contract-->>User: Withdrawn event
+
+    CLI-->>User: Withdrawal confirmed
 ```
 
-## 2. Provider Registration (Staking)
+## 3. Provider Registration (Staking)
 
 How a provider stakes TLP to become active in the marketplace.
 
@@ -70,16 +82,16 @@ sequenceDiagram
     Contract->>Contract: Check not banned
     Contract->>Contract: Check duration >= minStakeDuration
     Contract->>Contract: Transfer TLP from provider
-    Contract->>Contract: Create ProviderInfo<br/>{stakeAmount, unlockTime, isBanned=false}
+    Contract->>Contract: Create ProviderInfo<br/>{stakeAmount, unlockTime, isBanned=false, slashCount=0}
     Contract-->>Provider: Staked event
 
     CLI->>Marketplace: Register provider in marketplace
-    Marketplace-->>Provider: Provider now active<br/>Can receive rental requests
+    Marketplace-->>Provider: Provider now active<br/>Can receive service requests
 ```
 
-## 3. Provider Withdraws Earnings
+## 4. Provider Claims Earnings
 
-Provider claims tokens for delivered services. A commission is deducted and sent to the treasury.
+Provider claims from a user's balance after delivering service. A commission is deducted and sent to the treasury.
 
 ```mermaid
 sequenceDiagram
@@ -89,61 +101,70 @@ sequenceDiagram
     participant Contract as TLPStaking Contract
     participant Treasury
 
-    Provider->>CLI: Request withdrawal for rental
+    Provider->>CLI: Request claim for service
     CLI->>Backend: Verify service delivery
 
     Backend->>Backend: Check service metrics
-    Backend->>Backend: Calculate withdrawal amount<br/>(based on actual service delivered)
-    Backend->>Backend: Get current withdrawalNonces[rentalId]
-    Backend->>Backend: Create EIP712 WithdrawalApproval<br/>{rentalId, provider, amount, nonce}
+    Backend->>Backend: Calculate claim amount
+    Backend->>Contract: Query nonces[provider]
+    Contract-->>Backend: Current nonce
+
+    Backend->>Backend: Create EIP712 Claim<br/>{rentalId, user, provider, amount, nonce, deadline}
     Backend->>Backend: Sign with k-of-n signers
-    Backend-->>CLI: Return signatures
+    Backend-->>CLI: Return signatures + deadline
 
-    Provider->>Contract: withdrawRental(rentalId, amount, signatures)
+    Provider->>Contract: claim(rentalId, user, amount, deadline, signatures)
 
-    Contract->>Contract: Verify provider is rental recipient
+    Contract->>Contract: Verify provider is active & not banned
     Contract->>Contract: Verify signatures
-    Contract->>Contract: Check amount <= available balance
+    Contract->>Contract: Check amount <= userBalances[user]
     Contract->>Contract: Calculate commission<br/>(amount × commissionBps / 10000)
-    Contract->>Contract: Update withdrawnAmount
+    Contract->>Contract: Update user balance and provider nonce
     Contract->>Treasury: Transfer commission
     Contract->>Provider: Transfer (amount - commission)
-    Contract-->>Provider: RentalWithdrawn event
+    Contract-->>Provider: Claimed event (includes rentalId for audit)
 ```
 
-## 4. User Claims Refund
+## 5. Provider Batch Claims
 
-User gets tokens back for failed or partial service.
+Provider claims from multiple users in a single transaction for gas efficiency.
 
 ```mermaid
 sequenceDiagram
-    participant User
-    participant CLI as Timeleap CLI
+    participant Provider
     participant Backend as Timeleap Backend
     participant Contract as TLPStaking Contract
+    participant Treasury
 
-    User->>CLI: Request refund (service issue)
-    CLI->>Backend: Submit refund request with reason
+    Provider->>Backend: Request batch claims<br/>(multiple users/rentals)
 
-    Backend->>Backend: Validate refund eligibility<br/>(SLA violation, downtime, etc.)
-    Backend->>Backend: Calculate refund amount
-    Backend->>Backend: Get current refundNonces[rentalId]
-    Backend->>Backend: Create EIP712 RefundApproval<br/>{rentalId, user, amount, nonce}
-    Backend->>Backend: Sign with k-of-n signers
-    Backend-->>CLI: Return signatures + approved amount
+    Backend->>Contract: Query nonces[provider]
+    Contract-->>Backend: Current nonce
 
-    CLI->>User: Show approved refund amount
-    User->>Contract: claimRefund(rentalId, amount, signatures)
+    loop For each claim
+        Backend->>Backend: Create EIP712 Claim<br/>{rentalId_i, user_i, provider, amount_i, nonce+i, deadline}
+        Backend->>Backend: Sign with k-of-n signers
+    end
 
-    Contract->>Contract: Verify user is original renter
-    Contract->>Contract: Verify signatures
-    Contract->>Contract: Check amount <= available balance
-    Contract->>Contract: Transfer TLP to user
-    Contract->>Contract: Update refundedAmount
-    Contract-->>User: RefundClaimed event
+    Backend-->>Provider: Return all signatures
+
+    Provider->>Contract: batchClaim(claims[], signatures[][])
+
+    Contract->>Contract: Verify provider active & not banned
+    loop For each claim
+        Contract->>Contract: Verify signatures
+        Contract->>Contract: Update user balance
+        Contract->>Contract: Increment nonce
+        Contract->>Contract: Calculate commission
+    end
+    Contract->>Treasury: Transfer total commission
+    Contract->>Provider: Transfer total (amount - commission)
+    loop For each claim
+        Contract-->>Provider: Emit Claimed event
+    end
 ```
 
-## 5. Provider Misbehavior & Slashing
+## 6. Provider Misbehavior & Slashing
 
 Police enforcement when a provider fails to deliver or commits fraud.
 
@@ -176,13 +197,10 @@ sequenceDiagram
         Contract-->>Provider: ProviderSlashed event (banned=false)
     end
 
-    Note over Backend,Users: Affected users can claim refunds
-    Backend->>Backend: Sign refund approvals for affected rentals
-    Users->>Contract: claimRefund(rentalId, amount, signatures)
-    Contract-->>Users: Refund transferred
+    Note over Backend,Users: Users still have their pool balance<br/>Backend can assign them to new providers
 ```
 
-## 6. Provider Stake Management
+## 7. Provider Stake Management
 
 Options for providers to manage their stake over time.
 
@@ -231,42 +249,55 @@ flowchart TD
     end
 ```
 
-## 7. Complete Rental Lifecycle
+## 8. Provider Migration Scenario
 
-State machine showing all possible paths a rental can take.
+How the system handles seamless provider migration when a provider goes down.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> ProviderStaked: Provider stakes TLP
+sequenceDiagram
+    participant User
+    participant Backend
+    participant ProviderA as Provider A
+    participant ProviderB as Provider B
+    participant Contract
 
-    ProviderStaked --> RentalRequested: User requests VM
+    User->>Contract: deposit(100 TLP)
+    Contract-->>User: Deposited event
 
-    RentalRequested --> BackendApproval: CLI finds provider
-    BackendApproval --> SignaturesGenerated: Backend validates & signs
+    Note over Backend: Backend assigns user to Provider A
 
-    SignaturesGenerated --> PaymentPending: User receives signatures
-    PaymentPending --> RentalActive: User pays & submits tx
+    ProviderA->>User: Provision VM service
+    Note over ProviderA: Provider A serves user...
 
-    RentalActive --> ServiceDelivery: Provider provisions VM
+    ProviderA--xBackend: Provider A goes down!
 
-    ServiceDelivery --> FullCompletion: Service completed
-    ServiceDelivery --> PartialCompletion: Partial service
-    ServiceDelivery --> ServiceFailure: Provider failure
+    Backend->>Backend: Detect downtime
+    Backend->>Backend: Calculate Provider A's earned amount (30 TLP)
 
-    FullCompletion --> ProviderWithdrawal: Provider claims full amount
+    Note over Backend: Backend migrates user to Provider B
 
-    PartialCompletion --> SplitSettlement: Backend calculates split
-    SplitSettlement --> ProviderWithdrawal: Provider claims earned portion
-    SplitSettlement --> UserRefund: User claims refund portion
+    ProviderB->>User: Continue VM service
 
-    ServiceFailure --> Slashing: Police slashes provider
-    Slashing --> UserRefund: User claims full refund
+    Note over Backend: Time passes, service continues...
 
-    ProviderWithdrawal --> [*]: Rental closed
-    UserRefund --> [*]: Rental closed
+    Backend->>Backend: Provider A claims for service delivered
+    ProviderA->>Contract: claim(rentalId1, user, 30 TLP, ...)
+    Contract->>ProviderA: Transfer 30 TLP (minus commission)
+    Contract-->>Contract: User balance: 70 TLP
+
+    Backend->>Backend: Provider B claims for continued service
+    ProviderB->>Contract: claim(rentalId2, user, 40 TLP, ...)
+    Contract->>ProviderB: Transfer 40 TLP (minus commission)
+    Contract-->>Contract: User balance: 30 TLP
+
+    User->>Backend: Request withdrawal of remaining balance
+    Backend->>Contract: Sign withdrawal for 30 TLP
+    User->>Contract: withdraw(30 TLP, deadline, signatures)
+    Contract->>User: Transfer 30 TLP
+    Contract-->>Contract: User balance: 0 TLP
 ```
 
-## 8. EIP712 Signature Flow
+## 9. EIP712 Signature Flow
 
 How signatures are created by the backend and verified on-chain.
 
@@ -280,9 +311,8 @@ flowchart LR
     end
 
     subgraph types["Message Types"]
-        T1["RentalApproval<br/>(rentalId, user, provider, vm, duration, nonce)"]
-        T2["WithdrawalApproval<br/>(rentalId, provider, amount, nonce)"]
-        T3["RefundApproval<br/>(rentalId, user, amount, nonce)"]
+        T1["Withdrawal<br/>(user, amount, nonce, deadline)"]
+        T2["Claim<br/>(rentalId, user, provider, amount, nonce, deadline)"]
     end
 
     subgraph signing["Signing Process"]
@@ -293,25 +323,26 @@ flowchart LR
     end
 
     subgraph verification["On-Chain Verification"]
-        V1[Recreate digest from params]
-        V2[Recover signer from each sig]
-        V3[Check signer is authorized]
-        V4[Check no duplicate signers]
-        V5{k valid signatures?}
-        V6[Accept operation]
-        V7[Reject operation]
+        V1[Check deadline not expired]
+        V2[Recreate digest from params]
+        V3[Recover signer from each sig]
+        V4[Check signer is authorized]
+        V5[Check no duplicate signers]
+        V6{k valid signatures?}
+        V7[Accept operation]
+        V8[Reject operation]
     end
 
     domain --> S1
     types --> S1
     S1 --> S2 --> S3 --> S4
 
-    S4 --> V1 --> V2 --> V3 --> V4 --> V5
-    V5 -->|Yes| V6
-    V5 -->|No| V7
+    S4 --> V1 --> V2 --> V3 --> V4 --> V5 --> V6
+    V6 -->|Yes| V7
+    V6 -->|No| V8
 ```
 
-## 9. Fund Flow Overview
+## 10. Token Flow Overview
 
 Visual representation of how TLP tokens move through the system.
 
@@ -329,10 +360,10 @@ flowchart TB
             PS2[Provider B: 5,000 TLP]
         end
 
-        subgraph rentals["Rental Escrow"]
-            R1["Rental 1: 3.6 TLP<br/>(withdrawn: 0, refunded: 0)"]
-            R2["Rental 2: 7.2 TLP<br/>(withdrawn: 5, refunded: 0)"]
-            R3["Rental 3: 10 TLP<br/>(withdrawn: 3, refunded: 4)"]
+        subgraph pool["User Balance Pool"]
+            UB1["User 1: 100 TLP"]
+            UB2["User 2: 50 TLP"]
+            UB3["User 3: 200 TLP"]
         end
     end
 
@@ -343,16 +374,18 @@ flowchart TB
 
     Treasury[(Treasury)]
 
-    U1 -->|"rentFromProvider()"| R1
-    U2 -->|"rentFromProvider()"| R2
-    U3 -->|"rentFromProvider()"| R3
+    U1 -->|"deposit()"| UB1
+    U2 -->|"deposit()"| UB2
+    U3 -->|"deposit()"| UB3
 
     P1 -->|"stake()"| PS1
     P2 -->|"stake()"| PS2
 
-    R2 -->|"withdrawRental()<br/>(minus commission)"| P1
-    R2 -->|"commission"| Treasury
-    R3 -->|"claimRefund()"| U3
+    UB1 -->|"claim()<br/>(minus commission)"| P1
+    UB1 -->|"withdraw()<br/>(with signatures)"| U1
+    UB2 -->|"claim()<br/>(minus commission)"| P2
+
+    pool -->|"commission"| Treasury
 
     PS1 -->|"slashAndBan()"| Treasury
     PS2 -->|"withdrawStake()"| P2
@@ -362,34 +395,37 @@ flowchart TB
 
 ### Nonce Strategy
 
-| Action | Nonce Type | Tracking | Purpose |
-|--------|-----------|----------|---------|
-| Rental | Per-user | `rentalNonces[user]` | Prevent replay of same user's rental request |
-| Withdrawal | Per-rental | `withdrawalNonces[rentalId]` | Allow multiple partial withdrawals |
-| Refund | Per-rental | `refundNonces[rentalId]` | Allow multiple partial refunds |
+| Action     | Nonce Type   | Tracking           | Purpose                               |
+| ---------- | ------------ | ------------------ | ------------------------------------- |
+| Withdrawal | Per-user     | `nonces[user]`     | Prevent replay of withdrawal requests |
+| Claim      | Per-provider | `nonces[provider]` | Prevent replay of claim requests      |
 
-### Available Balance Calculation
+### Signature Deadline
 
-For any rental:
+All signatures include a `deadline` parameter:
+
 ```
-available = rental.amount - rental.withdrawnAmount - rental.refundedAmount
-```
-
-### Rental Duration Constraint
-
-Before accepting a rental, the contract verifies:
-```
-block.timestamp + duration + rentalGracePeriod <= provider.unlockTime
+if (block.timestamp > deadline) revert SignatureExpired();
 ```
 
-This ensures the provider's stake remains locked for the entire rental period plus a 7-day grace period.
+This provides time-based protection in addition to nonce-based replay prevention.
 
-### Commission on Withdrawals
+### Commission on Claims
 
-When providers withdraw their earnings, a commission is deducted and sent to the treasury:
+When providers claim earnings, a commission is deducted and sent to the treasury:
+
 ```
 commission = amount × commissionBps / 10000
 providerReceives = amount - commission
 ```
 
 Commission is configured in basis points (e.g., 500 = 5%, 1000 = 10%). Maximum is 10000 (100%).
+
+### Provider Migration
+
+The pool-based architecture enables seamless provider migration:
+
+1. **User deposits once** - tokens stay in the pool
+2. **Backend manages assignments** - no on-chain rental state
+3. **Multiple providers can claim** - from the same user's balance
+4. **No retoken logic needed** - unused balance remains in pool

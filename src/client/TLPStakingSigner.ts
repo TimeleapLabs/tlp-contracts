@@ -2,15 +2,14 @@ import type { Signer, TypedDataDomain } from "ethers";
 import {
   EIP712_TYPES,
   TLPStakingDomain,
-  RentalApprovalData,
-  WithdrawalApprovalData,
-  RefundApprovalData,
+  WithdrawalData,
+  ClaimData,
 } from "./types";
 import { EIP712_DOMAIN_NAME, EIP712_DOMAIN_VERSION } from "./constants";
 
 /**
  * EIP712 signature helper for TLPStaking contract operations.
- * Used by authorized signers to approve rentals, withdrawals, and refunds.
+ * Used by authorized signers to approve withdrawals and claims.
  */
 export class TLPStakingSigner {
   private readonly signer: Signer;
@@ -49,20 +48,18 @@ export class TLPStakingSigner {
   }
 
   /**
-   * Sign a rental approval for rentFromProvider
-   * @param data - Rental approval data
+   * Sign a withdrawal approval for user balance withdrawal
+   * @param data - Withdrawal data
    * @returns EIP712 signature
    */
-  async signRentalApproval(data: RentalApprovalData): Promise<string> {
+  async signWithdrawal(data: WithdrawalData): Promise<string> {
     const domain = this.getDomain();
-    const types = { RentalApproval: EIP712_TYPES.RentalApproval };
+    const types = { Withdrawal: EIP712_TYPES.Withdrawal };
     const value = {
-      rentalId: data.rentalId,
       user: data.user,
-      provider: data.provider,
-      vm: data.vm,
-      duration: data.duration,
+      amount: data.amount,
       nonce: data.nonce,
+      deadline: data.deadline,
     };
 
     return this.signer.signTypedData(
@@ -73,40 +70,20 @@ export class TLPStakingSigner {
   }
 
   /**
-   * Sign a withdrawal approval for withdrawRental
-   * @param data - Withdrawal approval data
+   * Sign a claim approval for provider to claim from user balance
+   * @param data - Claim data
    * @returns EIP712 signature
    */
-  async signWithdrawalApproval(data: WithdrawalApprovalData): Promise<string> {
+  async signClaim(data: ClaimData): Promise<string> {
     const domain = this.getDomain();
-    const types = { WithdrawalApproval: EIP712_TYPES.WithdrawalApproval };
-    const value = {
-      rentalId: data.rentalId,
-      provider: data.provider,
-      amount: data.amount,
-      nonce: data.nonce,
-    };
-
-    return this.signer.signTypedData(
-      domain as TypedDataDomain,
-      types,
-      value
-    );
-  }
-
-  /**
-   * Sign a refund approval for claimRefund
-   * @param data - Refund approval data
-   * @returns EIP712 signature
-   */
-  async signRefundApproval(data: RefundApprovalData): Promise<string> {
-    const domain = this.getDomain();
-    const types = { RefundApproval: EIP712_TYPES.RefundApproval };
+    const types = { Claim: EIP712_TYPES.Claim };
     const value = {
       rentalId: data.rentalId,
       user: data.user,
+      provider: data.provider,
       amount: data.amount,
       nonce: data.nonce,
+      deadline: data.deadline,
     };
 
     return this.signer.signTypedData(
@@ -126,7 +103,7 @@ export class TLPStakingSigner {
    * ```typescript
    * const signatures = await TLPStakingSigner.collectSignatures(
    *   [signer1, signer2],
-   *   (s) => s.signPaymentApproval({ user, provider, vm, duration, nonce })
+   *   (s) => s.signWithdrawal({ user, amount, nonce, deadline })
    * );
    * ```
    */

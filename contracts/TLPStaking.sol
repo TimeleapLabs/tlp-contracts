@@ -10,12 +10,13 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /**
  * @title TLPStaking
- * @notice Staking contract for Timeleap compute providers and VM rentals
- * @dev Providers stake TLP tokens, users rent VM resources from providers.
- *      Police can slash misbehaving providers.
- *      Rentals, withdrawals, and refunds require k-of-n EIP712 signatures from authorized signers.
- *      Each action type can have a different k value configured independently.
- *      Withdrawal and refund amounts are determined by backend signatures (not on-chain state).
+ * @notice Pool-based escrow contract for Timeleap compute providers
+ * @dev All business logic (VM types, pricing, rentals) is handled off-chain.
+ *      This contract is a simple escrow that:
+ *      - Accepts user deposits (no signature required)
+ *      - Executes withdrawals and claims with k-of-n EIP712 signatures
+ *      - Maintains provider staking for accountability
+ *      - Rental IDs are included in events for audit trail only (no on-chain state)
  */
 contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
@@ -24,12 +25,10 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     bytes32 public constant POLICE_ROLE = keccak256("POLICE_ROLE");
 
     // ============ EIP712 Type Hashes ============
-    bytes32 public constant RENTAL_TYPEHASH =
-        keccak256("RentalApproval(bytes32 rentalId,address user,address provider,bytes32 vm,uint256 duration,uint256 nonce)");
     bytes32 public constant WITHDRAWAL_TYPEHASH =
-        keccak256("WithdrawalApproval(bytes32 rentalId,address provider,uint256 amount,uint256 nonce)");
-    bytes32 public constant REFUND_TYPEHASH =
-        keccak256("RefundApproval(bytes32 rentalId,address user,uint256 amount,uint256 nonce)");
+        keccak256("Withdrawal(address user,uint256 amount,uint256 nonce,uint256 deadline)");
+    bytes32 public constant CLAIM_TYPEHASH =
+        keccak256("Claim(bytes32 rentalId,address user,address provider,uint256 amount,uint256 nonce,uint256 deadline)");
 
     // ============ Custom Errors ============
     error ZeroAddress();
@@ -42,52 +41,46 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     error NotAProvider();
     error InvalidDuration();
     error DurationTooShort();
-    error RentalNotFound();
-    error RentalAlreadyExists();
-    error AmountExceedsAvailable();
-    error NothingToWithdraw();
+    error InsufficientBalance();
     error InvalidSlashAmount();
-    error VmNotConfigured();
     error SignerAlreadyAuthorized();
     error SignerNotAuthorized();
     error InsufficientSignatures();
     error DuplicateSignature();
     error InvalidSignature();
     error InvalidRequiredSignatures();
-    error RentalExceedsStakeDuration();
     error ArrayLengthMismatch();
     error CommissionTooHigh();
+    error SignatureExpired();
 
     // ============ Events ============
+    // Provider events
     event Staked(address indexed provider, uint256 amount, uint256 unlockTime);
     event StakeExtended(address indexed provider, uint256 newUnlockTime);
     event StakeIncreased(address indexed provider, uint256 addedAmount, uint256 newTotal, uint256 newUnlockTime);
     event StakeWithdrawn(address indexed provider, uint256 amount);
-
-    event RentalCreated(
-        address indexed user,
-        address indexed provider,
-        bytes32 indexed rentalId,
-        uint256 amount,
-        bytes32 vm,
-        uint256 duration
-    );
-    event RentalWithdrawn(address indexed provider, bytes32 indexed rentalId, uint256 amount);
-    event RefundClaimed(address indexed user, address indexed provider, bytes32 indexed rentalId, uint256 amount);
-
     event ProviderSlashed(address indexed provider, uint256 slashedStake, bool banned);
     event ProviderUnbanned(address indexed provider);
 
-    event MinStakeDurationUpdated(uint256 oldDuration, uint256 newDuration);
-    event RentalGracePeriodUpdated(uint256 oldPeriod, uint256 newPeriod);
-    event TreasuryUpdated(address oldTreasury, address newTreasury);
-    event VmPriceUpdated(bytes32 indexed vm, uint256 oldPrice, uint256 newPrice);
+    // User balance events
+    event Deposited(address indexed user, uint256 amount, uint256 newBalance);
+    event Withdrawn(address indexed user, uint256 amount, uint256 newBalance);
 
+    // Claim events (rentalId for audit trail)
+    event Claimed(
+        bytes32 indexed rentalId,
+        address indexed user,
+        address indexed provider,
+        uint256 amount,
+        uint256 commission
+    );
+
+    // Admin events
+    event MinStakeDurationUpdated(uint256 oldDuration, uint256 newDuration);
+    event TreasuryUpdated(address oldTreasury, address newTreasury);
     event SignerAdded(address indexed signer);
     event SignerRemoved(address indexed signer);
-    event RequiredRentalSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
-    event RequiredWithdrawalSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
-    event RequiredRefundSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
+    event RequiredSignaturesUpdated(uint256 oldRequired, uint256 newRequired);
     event CommissionUpdated(uint256 oldCommission, uint256 newCommission);
 
     // ============ Structs ============
@@ -98,15 +91,11 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
         uint256 slashCount;
     }
 
-    struct Rental {
+    struct ClaimRequest {
+        bytes32 rentalId;
         address user;
-        address provider;
         uint256 amount;
-        uint256 timestamp;
-        bytes32 vm;
-        uint256 duration;
-        uint256 withdrawnAmount;
-        uint256 refundedAmount;
+        uint256 deadline;
     }
 
     // ============ State Variables ============
@@ -114,33 +103,27 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     address public treasury;
 
     uint256 public minStakeDuration = 30 days;
-    uint256 public rentalGracePeriod = 7 days;
     uint256 public commissionBps; // Commission in basis points (10000 = 100%)
 
+    // Provider staking
     mapping(address => ProviderInfo) public providers;
-    mapping(bytes32 => uint256) public vmPricePerSecond;
 
-    mapping(bytes32 => Rental) public rentals;
-    mapping(address => bytes32[]) public userRentals;
-    mapping(address => bytes32[]) public providerRentals;
+    // User balances in the pool
+    mapping(address => uint256) public userBalances;
+
+    // Single nonce per address for all operations
+    mapping(address => uint256) public nonces;
 
     // Signer management
     mapping(address => bool) public isSigner;
     address[] public signers;
-    uint256 public requiredRentalSignatures;
-    uint256 public requiredWithdrawalSignatures;
-    uint256 public requiredRefundSignatures;
-
-    // Nonces for replay protection
-    mapping(address => uint256) public rentalNonces;
-    mapping(bytes32 => uint256) public withdrawalNonces;
-    mapping(bytes32 => uint256) public refundNonces;
+    uint256 public requiredSignatures;
 
     // ============ Constructor ============
     /**
      * @notice Initializes the staking contract
      * @param _tlpToken Address of the TLP token
-     * @param _treasury Address where slashed funds are sent
+     * @param _treasury Address where commission and slashed funds are sent
      * @param _admin Address that will have admin role
      */
     constructor(
@@ -159,7 +142,124 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
         _grantRole(POLICE_ROLE, _admin);
     }
 
-    // ============ Provider Functions ============
+    // ============ User Balance Functions ============
+
+    /**
+     * @notice Deposit tokens to user's balance in the pool
+     * @param amount Amount of tokens to deposit
+     */
+    function deposit(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+
+        userBalances[_msgSender()] += amount;
+        tlpToken.safeTransferFrom(_msgSender(), address(this), amount);
+
+        emit Deposited(_msgSender(), amount, userBalances[_msgSender()]);
+    }
+
+    /**
+     * @notice Withdraw tokens from user's balance (requires k-of-n signatures)
+     * @param amount Amount to withdraw
+     * @param deadline Signature expiration timestamp
+     * @param signatures Array of signatures from authorized signers
+     */
+    function withdraw(
+        uint256 amount,
+        uint256 deadline,
+        bytes[] calldata signatures
+    ) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
+        if (block.timestamp > deadline) revert SignatureExpired();
+        if (amount > userBalances[_msgSender()]) revert InsufficientBalance();
+
+        uint256 nonce = nonces[_msgSender()]++;
+
+        _verifySignatures(
+            _hashTypedDataV4(
+                keccak256(abi.encode(WITHDRAWAL_TYPEHASH, _msgSender(), amount, nonce, deadline))
+            ),
+            signatures
+        );
+
+        userBalances[_msgSender()] -= amount;
+        tlpToken.safeTransfer(_msgSender(), amount);
+
+        emit Withdrawn(_msgSender(), amount, userBalances[_msgSender()]);
+    }
+
+    // ============ Provider Claim Functions ============
+
+    /**
+     * @notice Provider claims from a user's balance (requires k-of-n signatures)
+     * @param rentalId Rental ID for audit trail (not stored on-chain)
+     * @param user Address of the user to claim from
+     * @param amount Amount to claim
+     * @param deadline Signature expiration timestamp
+     * @param signatures Array of signatures from authorized signers
+     */
+    function claim(
+        bytes32 rentalId,
+        address user,
+        uint256 amount,
+        uint256 deadline,
+        bytes[] calldata signatures
+    ) external nonReentrant {
+        _verifyActiveProvider();
+
+        (uint256 commission, uint256 providerAmount) = _processClaim(
+            rentalId, user, amount, deadline, signatures
+        );
+
+        if (commission > 0) {
+            tlpToken.safeTransfer(treasury, commission);
+        }
+        tlpToken.safeTransfer(_msgSender(), providerAmount);
+
+        emit Claimed(rentalId, user, _msgSender(), amount, commission);
+    }
+
+    /**
+     * @notice Provider claims from multiple users in a single transaction
+     * @param claims Array of claim requests
+     * @param signatures Array of signature arrays for each claim
+     */
+    function batchClaim(
+        ClaimRequest[] calldata claims,
+        bytes[][] calldata signatures
+    ) external nonReentrant {
+        uint256 length = claims.length;
+        if (length != signatures.length) revert ArrayLengthMismatch();
+
+        _verifyActiveProvider();
+
+        uint256 totalAmount = 0;
+        uint256 totalCommission = 0;
+        uint256[] memory commissions = new uint256[](length);
+
+        for (uint256 i = 0; i < length; i++) {
+            ClaimRequest calldata req = claims[i];
+            (uint256 commission, uint256 providerAmount) = _processClaim(
+                req.rentalId, req.user, req.amount, req.deadline, signatures[i]
+            );
+            commissions[i] = commission;
+            totalCommission += commission;
+            totalAmount += providerAmount;
+        }
+
+        if (totalCommission > 0) {
+            tlpToken.safeTransfer(treasury, totalCommission);
+        }
+        if (totalAmount > 0) {
+            tlpToken.safeTransfer(_msgSender(), totalAmount);
+        }
+
+        for (uint256 i = 0; i < length; i++) {
+            ClaimRequest calldata req = claims[i];
+            emit Claimed(req.rentalId, req.user, _msgSender(), req.amount, commissions[i]);
+        }
+    }
+
+    // ============ Provider Staking Functions ============
 
     /**
      * @notice Stake tokens as a provider
@@ -172,7 +272,6 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
 
         ProviderInfo storage provider = providers[_msgSender()];
         if (provider.isBanned) revert ProviderBanned();
-
         if (provider.stakeAmount > 0) revert AlreadyStaked();
 
         provider.stakeAmount = amount;
@@ -239,204 +338,6 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
         tlpToken.safeTransfer(_msgSender(), amount);
 
         emit StakeWithdrawn(_msgSender(), amount);
-    }
-
-    // ============ User Functions ============
-
-    /**
-     * @notice Rent compute resources from a provider
-     * @param rentalId Unique rental ID (generated by backend)
-     * @param provider Address of the provider
-     * @param vm VM type identifier
-     * @param duration Duration of the VM rental in seconds
-     * @param signatures Array of signatures from authorized signers
-     */
-    function rentFromProvider(
-        bytes32 rentalId,
-        address provider,
-        bytes32 vm,
-        uint256 duration,
-        bytes[] calldata signatures
-    ) external nonReentrant {
-        if (rentalId == bytes32(0)) revert RentalNotFound();
-        if (provider == address(0)) revert ZeroAddress();
-        if (duration == 0) revert InvalidDuration();
-
-        // Check rental doesn't already exist
-        if (rentals[rentalId].user != address(0)) revert RentalAlreadyExists();
-
-        uint256 pricePerSecond = vmPricePerSecond[vm];
-        if (pricePerSecond == 0) revert VmNotConfigured();
-
-        uint256 amount = pricePerSecond * duration;
-
-        ProviderInfo storage providerInfo = providers[provider];
-        if (providerInfo.isBanned) revert ProviderBanned();
-        if (providerInfo.stakeAmount == 0) revert NotAProvider();
-        if (block.timestamp + duration + rentalGracePeriod > providerInfo.unlockTime) {
-            revert RentalExceedsStakeDuration();
-        }
-
-        uint256 nonce = rentalNonces[_msgSender()]++;
-
-        // Verify signatures
-        _verifySignatures(
-            _hashTypedDataV4(
-                keccak256(abi.encode(RENTAL_TYPEHASH, rentalId, _msgSender(), provider, vm, duration, nonce))
-            ),
-            signatures,
-            requiredRentalSignatures
-        );
-
-        rentals[rentalId] = Rental({
-            user: _msgSender(),
-            provider: provider,
-            amount: amount,
-            timestamp: block.timestamp,
-            vm: vm,
-            duration: duration,
-            withdrawnAmount: 0,
-            refundedAmount: 0
-        });
-
-        userRentals[_msgSender()].push(rentalId);
-        providerRentals[provider].push(rentalId);
-
-        tlpToken.safeTransferFrom(_msgSender(), address(this), amount);
-
-        emit RentalCreated(_msgSender(), provider, rentalId, amount, vm, duration);
-    }
-
-    /**
-     * @notice Claim refund for a rental with k-of-n signer approval
-     * @param rentalId ID of the rental to refund
-     * @param amount Amount to refund (must match signed amount)
-     * @param signatures Array of signatures from authorized signers
-     */
-    function claimRefund(bytes32 rentalId, uint256 amount, bytes[] calldata signatures) external nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-
-        Rental storage rental = rentals[rentalId];
-        if (rental.user == address(0)) revert RentalNotFound();
-        if (rental.user != _msgSender()) revert RentalNotFound();
-
-        uint256 available = rental.amount - rental.withdrawnAmount - rental.refundedAmount;
-        if (amount > available) revert AmountExceedsAvailable();
-
-        uint256 nonce = refundNonces[rentalId]++;
-
-        // Verify signatures
-        _verifySignatures(
-            _hashTypedDataV4(
-                keccak256(abi.encode(REFUND_TYPEHASH, rentalId, _msgSender(), amount, nonce))
-            ),
-            signatures,
-            requiredRefundSignatures
-        );
-
-        rental.refundedAmount += amount;
-
-        tlpToken.safeTransfer(_msgSender(), amount);
-
-        emit RefundClaimed(_msgSender(), rental.provider, rentalId, amount);
-    }
-
-    /**
-     * @notice Provider withdraws rental proceeds with k-of-n signer approval
-     * @param rentalId ID of the rental to withdraw
-     * @param amount Amount to withdraw (must match signed amount)
-     * @param signatures Array of signatures from authorized signers
-     */
-    function withdrawRental(bytes32 rentalId, uint256 amount, bytes[] calldata signatures) external nonReentrant {
-        if (amount == 0) revert ZeroAmount();
-
-        Rental storage rental = rentals[rentalId];
-        if (rental.user == address(0)) revert RentalNotFound();
-        if (rental.provider != _msgSender()) revert RentalNotFound();
-
-        uint256 available = rental.amount - rental.withdrawnAmount - rental.refundedAmount;
-        if (amount > available) revert AmountExceedsAvailable();
-
-        uint256 nonce = withdrawalNonces[rentalId]++;
-
-        // Verify signatures
-        _verifySignatures(
-            _hashTypedDataV4(
-                keccak256(abi.encode(WITHDRAWAL_TYPEHASH, rentalId, _msgSender(), amount, nonce))
-            ),
-            signatures,
-            requiredWithdrawalSignatures
-        );
-
-        rental.withdrawnAmount += amount;
-
-        uint256 commission = (amount * commissionBps) / 10000;
-        uint256 providerAmount = amount - commission;
-
-        if (commission > 0) {
-            tlpToken.safeTransfer(treasury, commission);
-        }
-        tlpToken.safeTransfer(_msgSender(), providerAmount);
-
-        emit RentalWithdrawn(_msgSender(), rentalId, amount);
-    }
-
-    /**
-     * @notice Provider withdraws from multiple rentals in a single transaction
-     * @param rentalIds Array of rental IDs to withdraw from
-     * @param amounts Array of amounts to withdraw from each rental
-     * @param signatures Array of signature arrays for each withdrawal
-     */
-    function batchWithdrawRental(
-        bytes32[] calldata rentalIds,
-        uint256[] calldata amounts,
-        bytes[][] calldata signatures
-    ) external nonReentrant {
-        uint256 length = rentalIds.length;
-        if (length != amounts.length || length != signatures.length) revert ArrayLengthMismatch();
-
-        uint256 totalAmount = 0;
-        uint256 totalCommission = 0;
-
-        for (uint256 i = 0; i < length; i++) {
-            bytes32 rentalId = rentalIds[i];
-            uint256 amount = amounts[i];
-
-            if (amount == 0) revert ZeroAmount();
-
-            Rental storage rental = rentals[rentalId];
-            if (rental.user == address(0)) revert RentalNotFound();
-            if (rental.provider != _msgSender()) revert RentalNotFound();
-
-            uint256 available = rental.amount - rental.withdrawnAmount - rental.refundedAmount;
-            if (amount > available) revert AmountExceedsAvailable();
-
-            uint256 nonce = withdrawalNonces[rentalId]++;
-
-            // Verify signatures
-            _verifySignatures(
-                _hashTypedDataV4(
-                    keccak256(abi.encode(WITHDRAWAL_TYPEHASH, rentalId, _msgSender(), amount, nonce))
-                ),
-                signatures[i],
-                requiredWithdrawalSignatures
-            );
-
-            rental.withdrawnAmount += amount;
-
-            uint256 commission = (amount * commissionBps) / 10000;
-            totalCommission += commission;
-            totalAmount += amount - commission;
-
-            emit RentalWithdrawn(_msgSender(), rentalId, amount);
-        }
-
-        if (totalCommission > 0) {
-            tlpToken.safeTransfer(treasury, totalCommission);
-        }
-        if (totalAmount > 0) {
-            tlpToken.safeTransfer(_msgSender(), totalAmount);
-        }
     }
 
     // ============ Police Functions ============
@@ -530,65 +431,27 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
         }
 
         // Adjust required signatures if needed
-        if (requiredRentalSignatures > signers.length) {
-            uint256 oldRequired = requiredRentalSignatures;
-            requiredRentalSignatures = signers.length;
-            emit RequiredRentalSignaturesUpdated(oldRequired, requiredRentalSignatures);
-        }
-        if (requiredWithdrawalSignatures > signers.length) {
-            uint256 oldRequired = requiredWithdrawalSignatures;
-            requiredWithdrawalSignatures = signers.length;
-            emit RequiredWithdrawalSignaturesUpdated(oldRequired, requiredWithdrawalSignatures);
-        }
-        if (requiredRefundSignatures > signers.length) {
-            uint256 oldRequired = requiredRefundSignatures;
-            requiredRefundSignatures = signers.length;
-            emit RequiredRefundSignaturesUpdated(oldRequired, requiredRefundSignatures);
+        if (requiredSignatures > signers.length) {
+            uint256 oldRequired = requiredSignatures;
+            requiredSignatures = signers.length;
+            emit RequiredSignaturesUpdated(oldRequired, requiredSignatures);
         }
 
         emit SignerRemoved(signer);
     }
 
     /**
-     * @notice Set the number of required signatures for rentals
+     * @notice Set the number of required signatures
      * @param _required Number of signatures required (k)
      */
-    function setRequiredRentalSignatures(uint256 _required) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setRequiredSignatures(uint256 _required) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_required == 0) revert InvalidRequiredSignatures();
         if (_required > signers.length) revert InvalidRequiredSignatures();
 
-        uint256 oldRequired = requiredRentalSignatures;
-        requiredRentalSignatures = _required;
+        uint256 oldRequired = requiredSignatures;
+        requiredSignatures = _required;
 
-        emit RequiredRentalSignaturesUpdated(oldRequired, _required);
-    }
-
-    /**
-     * @notice Set the number of required signatures for withdrawals
-     * @param _required Number of signatures required (k)
-     */
-    function setRequiredWithdrawalSignatures(uint256 _required) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_required == 0) revert InvalidRequiredSignatures();
-        if (_required > signers.length) revert InvalidRequiredSignatures();
-
-        uint256 oldRequired = requiredWithdrawalSignatures;
-        requiredWithdrawalSignatures = _required;
-
-        emit RequiredWithdrawalSignaturesUpdated(oldRequired, _required);
-    }
-
-    /**
-     * @notice Set the number of required signatures for refunds
-     * @param _required Number of signatures required (k)
-     */
-    function setRequiredRefundSignatures(uint256 _required) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_required == 0) revert InvalidRequiredSignatures();
-        if (_required > signers.length) revert InvalidRequiredSignatures();
-
-        uint256 oldRequired = requiredRefundSignatures;
-        requiredRefundSignatures = _required;
-
-        emit RequiredRefundSignaturesUpdated(oldRequired, _required);
+        emit RequiredSignaturesUpdated(oldRequired, _required);
     }
 
     // ============ Admin Functions ============
@@ -607,17 +470,6 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     }
 
     /**
-     * @notice Update rental grace period
-     * @param newPeriod New grace period in seconds
-     */
-    function setRentalGracePeriod(uint256 newPeriod) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        uint256 oldPeriod = rentalGracePeriod;
-        rentalGracePeriod = newPeriod;
-
-        emit RentalGracePeriodUpdated(oldPeriod, newPeriod);
-    }
-
-    /**
      * @notice Update treasury address
      * @param newTreasury New treasury address
      */
@@ -631,19 +483,7 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     }
 
     /**
-     * @notice Set price per second for a VM type
-     * @param vm VM type identifier
-     * @param pricePerSecond Price per second in TLP tokens (0 to disable)
-     */
-    function setVmPrice(bytes32 vm, uint256 pricePerSecond) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        uint256 oldPrice = vmPricePerSecond[vm];
-        vmPricePerSecond[vm] = pricePerSecond;
-
-        emit VmPriceUpdated(vm, oldPrice, pricePerSecond);
-    }
-
-    /**
-     * @notice Set commission rate for provider withdrawals
+     * @notice Set commission rate for provider claims
      * @param newCommissionBps Commission in basis points (10000 = 100%, e.g., 500 = 5%)
      */
     function setCommission(uint256 newCommissionBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -658,13 +498,59 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     // ============ Internal Functions ============
 
     /**
+     * @notice Verify that the caller is an active provider (staked and not banned)
+     */
+    function _verifyActiveProvider() internal view {
+        ProviderInfo storage provider = providers[_msgSender()];
+        if (provider.stakeAmount == 0) revert NotAProvider();
+        if (provider.isBanned) revert ProviderBanned();
+    }
+
+    /**
+     * @notice Process a single claim: validate, verify signatures, update balance
+     * @dev Does NOT emit event - caller must emit Claimed after token transfers
+     * @param rentalId Rental ID for audit trail
+     * @param user Address of the user to claim from
+     * @param amount Amount to claim
+     * @param deadline Signature expiration timestamp
+     * @param signatures Array of signatures from authorized signers
+     * @return commission The commission amount for treasury
+     * @return providerAmount The amount for the provider (amount - commission)
+     */
+    function _processClaim(
+        bytes32 rentalId,
+        address user,
+        uint256 amount,
+        uint256 deadline,
+        bytes[] calldata signatures
+    ) internal returns (uint256 commission, uint256 providerAmount) {
+        if (amount == 0) revert ZeroAmount();
+        if (block.timestamp > deadline) revert SignatureExpired();
+        if (user == address(0)) revert ZeroAddress();
+        if (amount > userBalances[user]) revert InsufficientBalance();
+
+        uint256 nonce = nonces[_msgSender()]++;
+
+        _verifySignatures(
+            _hashTypedDataV4(
+                keccak256(abi.encode(CLAIM_TYPEHASH, rentalId, user, _msgSender(), amount, nonce, deadline))
+            ),
+            signatures
+        );
+
+        userBalances[user] -= amount;
+
+        commission = (amount * commissionBps) / 10000;
+        providerAmount = amount - commission;
+    }
+
+    /**
      * @notice Verify that enough valid signatures from authorized signers are provided
      * @param digest The EIP712 digest to verify
      * @param signatures Array of signatures
-     * @param required Number of signatures required
      */
-    function _verifySignatures(bytes32 digest, bytes[] calldata signatures, uint256 required) internal view {
-        if (signatures.length < required) revert InsufficientSignatures();
+    function _verifySignatures(bytes32 digest, bytes[] calldata signatures) internal view {
+        if (signatures.length < requiredSignatures) revert InsufficientSignatures();
 
         address[] memory usedSigners = new address[](signatures.length);
         uint256 validCount = 0;
@@ -682,7 +568,7 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
             usedSigners[validCount] = recovered;
             validCount++;
 
-            if (validCount >= required) {
+            if (validCount >= requiredSignatures) {
                 return;
             }
         }
@@ -711,38 +597,27 @@ contract TLPStaking is AccessControl, ReentrancyGuard, EIP712 {
     }
 
     /**
-     * @notice Get rental information
-     * @param rentalId ID of the rental
-     * @return Rental struct with all rental details
-     */
-    function getRental(bytes32 rentalId) external view returns (Rental memory) {
-        Rental storage rental = rentals[rentalId];
-        if (rental.user == address(0)) revert RentalNotFound();
-        return rental;
-    }
-
-    /**
-     * @notice Get all rental IDs for a user
+     * @notice Get user's balance in the pool
      * @param user Address of the user
-     * @return Array of rental IDs
+     * @return User's balance
      */
-    function getUserRentals(address user) external view returns (bytes32[] memory) {
-        return userRentals[user];
+    function getUserBalance(address user) external view returns (uint256) {
+        return userBalances[user];
     }
 
     /**
-     * @notice Get all rental IDs received by a provider
-     * @param provider Address of the provider
-     * @return Array of rental IDs
+     * @notice Get current nonce for an address
+     * @param account Address to get nonce for
+     * @return Current nonce
      */
-    function getProviderRentals(address provider) external view returns (bytes32[] memory) {
-        return providerRentals[provider];
+    function getNonce(address account) external view returns (uint256) {
+        return nonces[account];
     }
 
     /**
-     * @notice Check if a provider can currently receive rentals
+     * @notice Check if a provider can currently receive claims
      * @param provider Address of the provider
-     * @return True if provider is active and can receive rentals
+     * @return True if provider is active
      */
     function isProviderActive(address provider) external view returns (bool) {
         ProviderInfo storage info = providers[provider];

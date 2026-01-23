@@ -5,26 +5,25 @@ export { TLPStakingSigner } from "./TLPStakingSigner";
 // Types
 export type {
   ProviderInfo,
-  Rental,
+  ClaimRequest,
   TLPStakingDomain,
-  RentalApprovalData,
-  WithdrawalApprovalData,
-  RefundApprovalData,
+  WithdrawalData,
+  ClaimData,
   StakedEvent,
   StakeExtendedEvent,
   StakeIncreasedEvent,
   StakeWithdrawnEvent,
-  RentalCreatedEvent,
-  RentalWithdrawnEvent,
-  RefundClaimedEvent,
   ProviderSlashedEvent,
   ProviderUnbannedEvent,
+  DepositedEvent,
+  WithdrawnEvent,
+  ClaimedEvent,
   SignerAddedEvent,
   SignerRemovedEvent,
-  RequiredRentalSignaturesUpdatedEvent,
-  RequiredWithdrawalSignaturesUpdatedEvent,
-  RequiredRefundSignaturesUpdatedEvent,
-  VmPriceUpdatedEvent,
+  RequiredSignaturesUpdatedEvent,
+  CommissionUpdatedEvent,
+  TreasuryUpdatedEvent,
+  MinStakeDurationUpdatedEvent,
 } from "./types";
 
 export { EIP712_TYPES } from "./types";
@@ -33,14 +32,15 @@ export { EIP712_TYPES } from "./types";
 export {
   POLICE_ROLE,
   DEFAULT_ADMIN_ROLE,
-  RENTAL_TYPEHASH,
   WITHDRAWAL_TYPEHASH,
-  REFUND_TYPEHASH,
+  CLAIM_TYPEHASH,
   MIN_STAKE_DURATION,
   ONE_DAY,
   ONE_HOUR,
   EIP712_DOMAIN_NAME,
   EIP712_DOMAIN_VERSION,
+  MAX_COMMISSION_BPS,
+  BPS_DENOMINATOR,
 } from "./constants";
 
 // Utilities
